@@ -1,0 +1,8 @@
+{
+  "name": "Toon Provider",
+  "description": "Tooniboy - Hindi & Multi-language Anime, Cartoons and Movies Streaming Extension",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/senkuboy0-cyber/Toon/builds/plugins.json"
+  ]
+}
