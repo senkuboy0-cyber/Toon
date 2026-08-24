@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 data class ToonMedia(
@@ -201,7 +202,7 @@ open class Tooniboy : MainAPI() {
                     || it.text().contains("Related", ignoreCase = true)
             }
 
-            val section: org.jsoup.nodes.Element? = if (header != null) {
+            val section: Element? = if (header != null) {
                 // Walk up to the section that owns this carousel
                 header.parents().firstOrNull { parent ->
                     parent.select("div.TPost.B").isNotEmpty()
@@ -209,7 +210,7 @@ open class Tooniboy : MainAPI() {
             } else null
 
             val cards = section?.select("div.TPost.B")
-                ?: document.select("div.MovieListTop div.TPost.B, div.MovieListSldCn ~ * div.TPost.B")
+                ?: document.select("div.MovieListTop div.TPost.B")
 
             for (el in cards) {
                 val href = el.selectFirst("a[href*='/series/'], a[href*='/movie/']")?.attr("href") ?: continue
