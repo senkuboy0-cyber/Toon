@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
@@ -33,7 +34,10 @@ open class Tooniboy : MainAPI() {
     // ─── Helpers ────────────────────────────────────────────────
 
     private fun Element.getImageSrc(): String? {
-        <REDACTED>
+        val img = this.selectFirst("img") ?: return null
+        val src = img.attr("data-src").ifEmpty { img.attr("src") }
+        if (src.isEmpty()) return null
+        return fixUrl(src)
     }
 
     private fun cleanTitle(title: String): String {
@@ -42,7 +46,7 @@ open class Tooniboy : MainAPI() {
 
     /**
      * Robust description extraction. Some entries (e.g. Demon Slayer)
-     * have an image-only first paragraph, real text in later ones.
+     * have an image-only first paragraph, real text lives in later ones.
      */
     private fun extractDescription(document: Document): String? {
         val descDiv = document.selectFirst("div.Description") ?: return null
@@ -63,11 +67,9 @@ open class Tooniboy : MainAPI() {
             if (text.length > 20) return text
         }
 
-        // Fallbacks
-        if (candidates.isEmpty()) {
-            document.selectFirst("meta[name=description]")?.attr("content")?.let {
-                if (it.isNotBlank()) return it.trim()
-            }
+        // Fallback to meta description
+        document.selectFirst("meta[name=description]")?.attr("content")?.let {
+            if (it.isNotBlank()) return it.trim()
         }
         return null
     }
@@ -256,8 +258,169 @@ open class Tooniboy : MainAPI() {
         return recs
     }
 
-    private suspend fun loadSeries(...): LoadResponse {
-        // unchanged logic — kept identical
-        TODO("placeholder")
+    private suspend fun loadSeries(
+        media: ToonMedia,
+        document: Document,
+        title: String,
+        poster: String?,
+        background: String?,
+        description: String?,
+        year: Int?,
+        rating: Double?,
+        recommendations: List<SearchResponse>
+    ): LoadResponse {
+        val episodes = mutableListOf<Episode>()
+        val seasonSlugRegex = Regex("/season/(.+)-(\\d+)/?$")
+
+        val seasons = document.select("section.SeasonBx .Title a[href*='/season/']")
+        val seasonUrls = LinkedHashSet<String>()
+
+        for (a in seasons) {
+            seasonUrls.add(fixUrl(a.attr("href")))
+        }
+
+        // Fallback: derive season 1 from series slug
+        if (seasonUrls.isEmpty()) {
+            val slug = media.url.trimEnd('/').substringAfterLast('/')
+            seasonUrls.add("$mainUrl/season/$slug-1/")
+        }
+
+        for ((index, seasonUrl) in seasonUrls.withIndex()) {
+            val match = seasonSlugRegex.find(seasonUrl)
+            val seasonNum = match?.groupValues?.get(2)?.toIntOrNull() ?: (index + 1)
+
+            val seasonDoc = try {
+                app.get(seasonUrl).document
+            } catch (e: Exception) {
+                Log.e("Tooniboy", "Failed to load season $seasonNum: ${e.message}")
+                null
+            } ?: continue
+
+            val rows = seasonDoc.select("div.TPTblCn table tbody tr")
+            if (rows.isNotEmpty()) {
+                for (row in rows) {
+                    val epNum = row.selectFirst("td span.Num")?.text()?.trim()?.toIntOrNull() ?: continue
+                    val epLink = row.selectFirst("td.MvTbImg a[href], td.MvTbTtl a[href]")?.attr("href") ?: continue
+                    val epThumb = row.selectFirst("td.MvTbImg img")?.let { row.getImageSrc() }
+                    val epName = row.selectFirst("td.MvTbTtl a")?.text()?.trim().orEmpty()
+                        .ifBlank { "Episode $epNum" }
+
+                    episodes.add(
+                        newEpisode(Gson().toJson(EpisodeData(fixUrl(epLink)))) {
+                            this.name = epName
+                            this.posterUrl = epThumb
+                            this.season = seasonNum
+                            this.episode = epNum
+                        }
+                    )
+                }
+            } else {
+                var fallbackEp = 1
+                for (el in seasonDoc.select("article.TPost, li.TPostMv")) {
+                    val href = el.selectFirst("a[href*='/episode/']")?.attr("href") ?: continue
+                    val name = cleanTitle(el.selectFirst("h2.Title")?.text() ?: "Episode $fallbackEp")
+                    episodes.add(
+                        newEpisode(Gson().toJson(EpisodeData(fixUrl(href)))) {
+                            this.name = name
+                            this.season = seasonNum
+                            this.episode = fallbackEp
+                        }
+                    )
+                    fallbackEp++
+                }
+            }
+        }
+
+        return newTvSeriesLoadResponse(title, Gson().toJson(media), TvType.TvSeries, episodes) {
+            this.posterUrl = poster
+            this.backgroundPosterUrl = background ?: poster
+            this.plot = description
+            this.year = year
+            this.score = Score.from10(rating)
+            this.recommendations = recommendations
+        }
+    }
+
+    // ─── Load Links (Servers) ───────────────────────────────────
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val epData = try {
+            Gson().fromJson(data, EpisodeData::class.java)
+        } catch (e: Exception) {
+            Log.e("Tooniboy", "Failed to parse episode data: ${e.message}")
+            return false
+        }
+
+        val document = app.get(epData.url).document
+
+        // ── Server buttons: key + trid ──
+        val serverButtons = document.select("button[data-key][data-id]")
+        val trid = serverButtons.firstOrNull()?.attr("data-id")
+            ?: document.selectFirst("[data-id]")?.attr("data-id")
+            ?: Regex("""trid=(\d+)""").find(document.html())?.groupValues?.get(1)
+
+        var success = false
+
+        // ── Default player (VidStreamX → animedekho embed → as-cdn26) ──
+        val defaultIframe = document.selectFirst("div.Video.on > iframe[src]")
+        defaultIframe?.attr("src")?.takeIf { it.isNotBlank() }?.let { src ->
+            try {
+                val resolved = resolveDefaultPlayer(src)
+                if (!resolved.isNullOrEmpty()) {
+                    loadExtractor(resolved, subtitleCallback, callback)
+                    success = true
+                } else {
+                    loadExtractor(src, epData.url, subtitleCallback, callback)
+                    success = true
+                }
+            } catch (e: Exception) {
+                Log.e("Tooniboy", "Default player failed: ${e.message}")
+            }
+        }
+
+        // ── trembed servers (key 0..8) ──
+        if (trid != null) {
+            for (btn in serverButtons) {
+                val key = btn.attr("data-key").toIntOrNull() ?: continue
+                val label = btn.text().trim().ifBlank { "Server ${key + 1}" }
+                try {
+                    val embedDoc = app.get("$mainUrl/?trembed=$key&trid=$trid&trtype=2").document
+                    val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")
+                        ?.replace("&amp;", "&")
+                    if (!iframeSrc.isNullOrBlank()) {
+                        loadExtractor(iframeSrc, epData.url, subtitleCallback, callback)
+                        success = true
+                        Log.d("Tooniboy", "[$label] $iframeSrc")
+                    }
+                } catch (e: Exception) {
+                    Log.e("Tooniboy", "Server key=$key ($label) failed: ${e.message}")
+                }
+            }
+        }
+
+        return success
+    }
+
+    /**
+     * Default VidStreamX player resolves through animedekho.app embed
+     * to an as-cdn*.top video page handled by the Zephyrflick extractor.
+     */
+    private suspend fun resolveDefaultPlayer(src: String): String? {
+        return try {
+            if (src.contains("as-cdn")) {
+                src
+            } else {
+                val innerDoc = app.get(src).document
+                innerDoc.selectFirst("iframe[src]")?.attr("src")
+                    ?.takeIf { it.contains("as-cdn") || it.contains("zephyrflick") || it.contains("awstream") }
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 }
