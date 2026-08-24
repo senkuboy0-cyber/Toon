@@ -4,16 +4,15 @@ import com.google.gson.Gson
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 data class ToonMedia(
     val url: String,
     val poster: String? = null,
     val title: String? = null,
-    val isSeries: Boolean = false
 )
+
+data class EpisodeData(val url: String)
 
 open class Tooniboy : MainAPI() {
     override var mainUrl = "https://tooniboy.co"
@@ -34,9 +33,7 @@ open class Tooniboy : MainAPI() {
 
     private fun Element.getImageSrc(): String? {
         val img = this.selectFirst("img") ?: return null
-        val src = img.attr("data-src").ifEmpty {
-            img.attr("src")
-        }
+        val src = img.attr("data-src").ifEmpty { img.attr("src") }
         if (src.isEmpty()) return null
         return fixUrl(src)
     }
@@ -45,6 +42,11 @@ open class Tooniboy : MainAPI() {
         return title.replace(Regex("\\s+"), " ").trim()
     }
 
+    /**
+     * Universal card parser for toroflix theme.
+     * Cards appear as div.TPost.B (search/list/recommendations)
+     * or article.TPost.B — both contain a.Image img + h2.Title inside an <a>.
+     */
     private fun Element.toSearchResult(tvType: TvType): SearchResponse? {
         val anchor = this.selectFirst("a[href*='/series/'], a[href*='/movie/']") ?: return null
         val href = fixUrl(anchor.attr("href"))
@@ -61,6 +63,30 @@ open class Tooniboy : MainAPI() {
         return newMovieSearchResponse(title, Gson().toJson(ToonMedia(href, poster, title)), tvType) {
             this.posterUrl = poster
         }
+    }
+
+    private fun parseCardList(document: Document): MutableList<SearchResponse> {
+        val home = mutableListOf<SearchResponse>()
+        val seen = mutableSetOf<String>()
+
+        // toroflix renders cards as div.TPost.B (not <article>); accept both
+        val elements = document.select("div.TPost.B, article.TPost.B, li.TPostMv")
+        for (el in elements) {
+            val href = el.selectFirst("a[href]")?.attr("href") ?: continue
+            if (!seen.add(href)) continue
+
+            val type = when {
+                href.contains("/movie/") -> TvType.Movie
+                else -> TvType.TvSeries
+            }
+            el.toSearchResult(type)?.let { home.add(it) }
+        }
+        return home
+    }
+
+    private fun parseDuration(text: String?): Int? {
+        if (text.isNullOrBlank()) return null
+        return Regex("(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
     }
 
     // ─── Main Page ──────────────────────────────────────────────
@@ -88,25 +114,11 @@ open class Tooniboy : MainAPI() {
         } + (if (page > 1) "/page/$page/" else "/")
 
         val document = app.get(url).document
+        val home = parseCardList(document)
 
-        val home = mutableListOf<SearchResponse>()
-        val seen = mutableSetOf<String>()
-
-        val elements = document.select(
-            "article.TPost.B, div.TPostMv, .MovieList article, .VideoList article"
-        )
-        for (el in elements) {
-            val href = el.selectFirst("a[href]")?.attr("href") ?: continue
-            if (!seen.add(href)) continue
-
-            val type = when {
-                href.contains("/movie/") -> TvType.Movie
-                else -> TvType.TvSeries
-            }
-            el.toSearchResult(type)?.let { home.add(it) }
-        }
-
-        val hasNext = document.selectFirst("a.next.page-numbers, link[rel=next], .wp-pagenavi .next") != null
+        val hasNext = document.selectFirst(
+            "a.next.page-numbers, link[rel=next], .wp-pagenavi .next, div.pagination a.next"
+        ) != null
 
         return newHomePageResponse(request.name, home, hasNext)
     }
@@ -116,18 +128,7 @@ open class Tooniboy : MainAPI() {
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val url = "$mainUrl/page/$page/?s=$query"
         val document = app.get(url).document
-
-        val results = mutableListOf<SearchResponse>()
-        val elements = document.select("article.TPost.B, div.TPostMv, .MovieList article")
-
-        for (el in elements) {
-            val type = when {
-                el.selectFirst("span.Qlty")?.text()?.contains("Movie", ignoreCase = true) == true -> TvType.Movie
-                else -> TvType.TvSeries
-            }
-            el.toSearchResult(type)?.let { results.add(it) }
-        }
-
+        val results = parseCardList(document)
         return newSearchResponseList(results, results.isNotEmpty())
     }
 
@@ -157,50 +158,71 @@ open class Tooniboy : MainAPI() {
         val description = document.selectFirst("div.Description > p")?.text()?.trim()
             ?: document.selectFirst("meta[name=description]")?.attr("content")
 
-        // ── Year / Rating / Duration ──
+        // ── Meta ──
         val year = document.selectFirst("span.Date")?.text()?.trim()?.toIntOrNull()
         val rating = document.selectFirst("div.post-ratings span")?.text()?.trim()?.toDoubleOrNull()
         val duration = document.selectFirst("span.Time")?.text()?.trim()
-        val quality = document.selectFirst("span.Qlty")?.text()?.trim()
 
-        // ── Genres ──
-        val genres = document.select("p.Genre a").mapNotNull { it.text().trim().takeIf { t -> t.isNotEmpty() } }
+        // ── Recommendations: "More titles like this" section only ──
+        val recommendations = parseRecommendations(document)
 
-        // ── Cast ──
-        val cast = document.select("p.Cast a").mapNotNull { it.text().trim().takeIf { t -> t.isNotEmpty() } }
-
-        // ── Tags ──
-        val tags = document.select("p.Tags a").mapNotNull { it.text().trim().takeIf { t -> t.isNotEmpty() } }
-
-        // ── Recommendations ("More titles like this") ──
-        val recommendations = mutableListOf<SearchResponse>()
-        for (el in document.select("div.MovieListTop article.TPost.B, div.MovieList article.TPost.B")) {
-            el.toSearchResult(TvType.TvSeries)?.let { recommendations.add(it) }
-        }
-
-        // ── Determine series vs movie ──
+        // ── Series vs Movie ──
         val seasonLinks = document.select("section.SeasonBx .Title a[href*='/season/']")
         val isSeries = actualUrl.contains("/series/") && seasonLinks.isNotEmpty()
 
         return if (isSeries) {
-            loadSeries(
-                media, document, rawTitle, poster, background, description,
-                year, rating, genres, cast, recommendations
-            )
+            loadSeries(media, document, rawTitle, poster, background, description, year, rating, recommendations)
         } else {
-            newMovieLoadResponse(rawTitle, url, TvType.Movie, Gson().toJson(ToonMedia(actualUrl, poster, rawTitle))) {
+            newMovieLoadResponse(rawTitle, url, TvType.Movie, Gson().toJson(EpisodeData(actualUrl))) {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = background ?: poster
                 this.plot = description
                 this.year = year
                 this.score = Score.from10(rating)
                 this.duration = parseDuration(duration)
-                this.tags = genres.ifEmpty { tags }
-                this.actors = cast.map { ActorData(Actor(it)) }
                 this.recommendations = recommendations
-                this.comingSoon = quality?.equals("ON AIR", ignoreCase = true) == false && description.isNullOrBlank()
             }
         }
+    }
+
+    /**
+     * Parses ONLY the "More titles like this" carousel:
+     * div.MovieListTop.owl-carousel.Serie > div.TPostMv > div.TPost.B
+     */
+    private fun parseRecommendations(document: Document): List<SearchResponse> {
+        val recs = mutableListOf<SearchResponse>()
+        val seen = mutableSetOf<String>()
+
+        try {
+            // Section header contains the exact title text
+            val header = document.select("div.Top .Title").firstOrNull {
+                it.text().contains("More titles like this", ignoreCase = true)
+                    || it.text().contains("More like this", ignoreCase = true)
+                    || it.text().contains("Related", ignoreCase = true)
+            }
+
+            val section: org.jsoup.nodes.Element? = if (header != null) {
+                // Walk up to the section that owns this carousel
+                header.parents().firstOrNull { parent ->
+                    parent.select("div.TPost.B").isNotEmpty()
+                }
+            } else null
+
+            val cards = section?.select("div.TPost.B")
+                ?: document.select("div.MovieListTop div.TPost.B, div.MovieListSldCn ~ * div.TPost.B")
+
+            for (el in cards) {
+                val href = el.selectFirst("a[href*='/series/'], a[href*='/movie/']")?.attr("href") ?: continue
+                if (!seen.add(href)) continue
+
+                val type = if (href.contains("/movie/")) TvType.Movie else TvType.TvSeries
+                el.toSearchResult(type)?.let { recs.add(it) }
+            }
+        } catch (e: Exception) {
+            Log.e("Tooniboy", "recommendations failed: ${e.message}")
+        }
+
+        return recs
     }
 
     private suspend fun loadSeries(
@@ -212,29 +234,26 @@ open class Tooniboy : MainAPI() {
         description: String?,
         year: Int?,
         rating: Double?,
-        genres: List<String>,
-        cast: List<String>,
         recommendations: List<SearchResponse>
     ): LoadResponse {
         val episodes = mutableListOf<Episode>()
-        val seriesSlugRegex = Regex("/season/(.+)-(\\d+)/?$")
+        val seasonSlugRegex = Regex("/season/(.+)-(\\d+)/?$")
 
         val seasons = document.select("section.SeasonBx .Title a[href*='/season/']")
         val seasonUrls = LinkedHashSet<String>()
 
         for (a in seasons) {
-            val href = fixUrl(a.attr("href"))
-            seasonUrls.add(href)
+            seasonUrls.add(fixUrl(a.attr("href")))
         }
 
-        // Fallback: derive from series slug if no explicit links found
+        // Fallback: derive season 1 from series slug
         if (seasonUrls.isEmpty()) {
             val slug = media.url.trimEnd('/').substringAfterLast('/')
             seasonUrls.add("$mainUrl/season/$slug-1/")
         }
 
         for ((index, seasonUrl) in seasonUrls.withIndex()) {
-            val match = seriesSlugRegex.find(seasonUrl)
+            val match = seasonSlugRegex.find(seasonUrl)
             val seasonNum = match?.groupValues?.get(2)?.toIntOrNull() ?: (index + 1)
 
             val seasonDoc = try {
@@ -244,13 +263,12 @@ open class Tooniboy : MainAPI() {
                 null
             } ?: continue
 
-            // Episode table rows (toroflix theme: TPTblCn table)
             val rows = seasonDoc.select("div.TPTblCn table tbody tr")
             if (rows.isNotEmpty()) {
                 for (row in rows) {
                     val epNum = row.selectFirst("td span.Num")?.text()?.trim()?.toIntOrNull() ?: continue
                     val epLink = row.selectFirst("td.MvTbImg a[href], td.MvTbTtl a[href]")?.attr("href") ?: continue
-                    val epThumb = row.selectFirst("td.MvTbImg img")?.let { row.fixUrlFromImg(it) }
+                    val epThumb = row.selectFirst("td.MvTbImg img")?.let { row.getImageSrc() }
                     val epName = row.selectFirst("td.MvTbTtl a")?.text()?.trim().orEmpty()
                         .ifBlank { "Episode $epNum" }
 
@@ -264,7 +282,6 @@ open class Tooniboy : MainAPI() {
                     )
                 }
             } else {
-                // Fallback: episode articles
                 var fallbackEp = 1
                 for (el in seasonDoc.select("article.TPost, li.TPostMv")) {
                     val href = el.selectFirst("a[href*='/episode/']")?.attr("href") ?: continue
@@ -287,26 +304,11 @@ open class Tooniboy : MainAPI() {
             this.plot = description
             this.year = year
             this.score = Score.from10(rating)
-            this.tags = genres
-            this.actors = cast.map { ActorData(Actor(it)) }
             this.recommendations = recommendations
         }
     }
 
-    private fun Element.fixUrlFromImg(img: Element): String? {
-        val src = img.attr("data-src").ifEmpty { img.attr("src") }
-        return if (src.isEmpty()) null else fixUrl(src)
-    }
-
-    private fun parseDuration(text: String?): Int? {
-        if (text.isNullOrBlank()) return null
-        val min = Regex("(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
-        return min
-    }
-
     // ─── Load Links (Servers) ───────────────────────────────────
-
-    data class EpisodeData(val url: String)
 
     override suspend fun loadLinks(
         data: String,
@@ -327,6 +329,7 @@ open class Tooniboy : MainAPI() {
         val serverButtons = document.select("button[data-key][data-id]")
         val trid = serverButtons.firstOrNull()?.attr("data-id")
             ?: document.selectFirst("[data-id]")?.attr("data-id")
+            ?: Regex("""trid=(\d+)""").find(document.html())?.groupValues?.get(1)
 
         var success = false
 
@@ -353,14 +356,13 @@ open class Tooniboy : MainAPI() {
                 val key = btn.attr("data-key").toIntOrNull() ?: continue
                 val label = btn.text().trim().ifBlank { "Server ${key + 1}" }
                 try {
-                    val embedUrl = "$mainUrl/?trembed=$key&trid=$trid&trtype=2"
-                    val embedDoc = app.get(embedUrl).document
+                    val embedDoc = app.get("$mainUrl/?trembed=$key&trid=$trid&trtype=2").document
                     val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")
+                        ?.replace("&amp;", "&")
                     if (!iframeSrc.isNullOrBlank()) {
-                        val fixed = iframeSrc.replace("&amp;", "&")
-                        loadExtractor(fixed, epData.url, subtitleCallback, callback)
+                        loadExtractor(iframeSrc, epData.url, subtitleCallback, callback)
                         success = true
-                        Log.d("Tooniboy", "[$label] $fixed")
+                        Log.d("Tooniboy", "[$label] $iframeSrc")
                     }
                 } catch (e: Exception) {
                     Log.e("Tooniboy", "Server key=$key ($label) failed: ${e.message}")
