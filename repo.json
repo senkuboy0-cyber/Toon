@@ -1,0 +1,8 @@
+{
+  "name": "Toon Provider",
+  "description": "The ultimate CloudStream repository for high-quality Hindi and multi-language dubbed Anime, Cartoons, and Movies.",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/senkuboy0-cyber/Toon/builds/plugins.json"
+  ]
+}
