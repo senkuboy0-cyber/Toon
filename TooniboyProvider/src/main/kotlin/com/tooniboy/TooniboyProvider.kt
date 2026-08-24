@@ -74,6 +74,23 @@ open class Tooniboy : MainAPI() {
     private val TMDB_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/original"
 
+    /**
+     * Full title cleaner (parity with AnimeDekho cleanTitleText):
+     * strips "Watch Online", episode patterns (1x08 / Episode 5),
+     * Season suffixes, fandub markers, and anything inside (...)/[...].
+     */
+    private fun cleanForTmdb(title: String): String {
+        var t = title.replace(Regex("Watch Online", RegexOption.IGNORE_CASE), "")
+        t = t.replace(Regex("\\s+\\d+[x×]\\d+.*"), "")                       // " 1x8 ..." suffixes
+        t = t.replace(Regex("\\s+Episode\\s+\\d+.*", RegexOption.IGNORE_CASE), "")
+        t = t.replace(Regex("\\s+Season\\s+\\d+.*", RegexOption.IGNORE_CASE), "")
+        t = t.replace(Regex("\\s*fan\\s*dub.*", RegexOption.IGNORE_CASE), "")
+        t = t.replace(Regex("\\s*fandub.*", RegexOption.IGNORE_CASE), "")
+        t = t.substringBefore("(").substringBefore("[")
+        t = t.trim()
+        return t.ifBlank { title }
+    }
+
     private fun normalizeTitle(s: String?): String =
         (s ?: "").replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
 
@@ -91,6 +108,10 @@ open class Tooniboy : MainAPI() {
         return diff == 0 || diff == 1 || diff == -1
     }
 
+    /**
+     * Year verification (±1) then animation-genre preference,
+     * mirroring AnimeDekho pickBestResult.
+     */
     private fun pickBestResult(candidates: List<TmdbResult>, siteYear: Int?): TmdbResult? {
         if (candidates.isEmpty()) return null
 
@@ -107,22 +128,10 @@ open class Tooniboy : MainAPI() {
     }
 
     /**
-     * Cleans site title for TMDB search: strips dub/sub markers
-     * and season suffixes that would break matching.
-     */
-    private fun cleanForTmdb(title: String): String {
-        var t = title
-            .replace(Regex("\\((?:[^)]*)(?:dub|sub|audio|hindi|english|japanese)(?:[^)]*)\\)", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\[(?:[^]]*)(?:dub|sub|audio|hindi|english|japanese)(?:[^]]*)\\]", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\s+Season\\s+\\d+.*$", RegexOption.IGNORE_CASE), "")
-            .trim()
-        return t.ifBlank { title }
-    }
-
-    /**
      * Fetches ONLY logo + backdrop from TMDB.
-     * Matching: exact normalized title -> startsWith -> IMDB id fallback.
-     * Year ±1 filter, animation-genre preference.
+     * Matching chain: exact normalized title -> startsWith -> IMDB id.
+     * Logo langs: en -> none -> ja -> first (SVG skipped).
+     * Backdrop langs: none -> en -> first.
      */
     private suspend fun fetchTmdbAssets(document: Document?, rawTitle: String, isSeries: Boolean, year: Int?): TmdbDetails {
         return try {
@@ -142,7 +151,7 @@ open class Tooniboy : MainAPI() {
 
             val normTitle = normalizeTitle(title)
 
-            // 1) Exact normalized-title match
+            // 1) Exact normalized-title match (title verification)
             val exactCandidates = validResults.filter {
                 normalizeTitle(it.title) == normTitle || normalizeTitle(it.name) == normTitle
             }
@@ -155,7 +164,8 @@ open class Tooniboy : MainAPI() {
             // 2) startsWith match
             if (tmdbId == null && normTitle.length >= 6) {
                 val startsWithCandidates = validResults.filter {
-                    (normalizeTitle(it.title).ifEmpty { normalizeTitle(it.name) }).startsWith(normTitle)
+                    val tn = normalizeTitle(it.title).ifEmpty { normalizeTitle(it.name) }
+                    tn.startsWith(normTitle)
                 }
                 val swMatch = pickBestResult(startsWithCandidates, year)
                 if (swMatch != null) {
@@ -202,10 +212,10 @@ open class Tooniboy : MainAPI() {
             var backdropUrl: String? = null
 
             if (images != null) {
-                // Logo: skip SVGs; prefer en -> null-lang -> ja -> first
+                // Logo: skip SVGs; prefer en -> none -> ja -> first
                 images.logos?.let { logos ->
-                    val validLogos = logos.filter { path ->
-                        val p = path.filePath ?: ""
+                    val validLogos = logos.filter { img ->
+                        val p = img.filePath ?: ""
                         p.isNotEmpty() && !p.endsWith(".svg") && !p.endsWith(".SVG")
                     }
                     val bestLogo = validLogos.firstOrNull { it.lang == "en" }
@@ -215,7 +225,7 @@ open class Tooniboy : MainAPI() {
                     bestLogo?.filePath?.let { logoUrl = "$TMDB_IMG$it" }
                 }
 
-                // Backdrop: prefer null-lang -> en -> first
+                // Backdrop: prefer none -> en -> first
                 images.backdrops?.let { backs ->
                     val bestBackdrop = backs.firstOrNull { it.lang == null }
                         ?: backs.firstOrNull { it.lang == "en" }
@@ -242,7 +252,6 @@ open class Tooniboy : MainAPI() {
 
     private fun cleanTitle(title: String): String {
         return title.replace(Regex("\\s+"), " ").trim()
-            .replace("&amp;", "&")
     }
 
     /**
