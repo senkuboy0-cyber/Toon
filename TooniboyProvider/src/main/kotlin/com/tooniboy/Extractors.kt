@@ -253,8 +253,10 @@ open class GDMirrorbot : ExtractorApi() {
 
             if (finalId != null && myKey != null) {
                 val apiUrl = if (url.contains("/tv/")) {
-                    val season = Regex(""/tv/\d+/(\d+)/"").find(url)?.groupValues?.get(1) ?: "1"
-                    val episode = Regex(""/tv/\d+/\d+/(\d+)"").find(url)?.groupValues?.get(1) ?: "1"
+                    val seasonRegex = Regex("""/tv/\d+/(\d+)/""")
+                    val episodeRegex = Regex("""/tv/\d+/\d+/(\d+)""")
+                    val season = seasonRegex.find(url)?.groupValues?.get(1) ?: "1"
+                    val episode = episodeRegex.find(url)?.groupValues?.get(1) ?: "1"
                     "$mainUrl/myseriesapi?tmdbid=$finalId&season=$season&epname=$episode&key=$myKey"
                 } else {
                     "$mainUrl/mymovieapi?$idType=$finalId&key=$myKey"
@@ -416,7 +418,7 @@ class Blakite : ExtractorApi() {
         }
 
         val apiUrl = if (uniqueId != null) {
-            "$mainUrl/api/get.php?id=${URLEncoder.encode(uniqueId, "UTF-8")}&tmdbId=$tmdbId"
+            "$mainUrl/api/get.php?id=$uniqueId&tmdbId=$tmdbId"
         } else {
             "$mainUrl/api/get.php?tmdbId=$tmdbId"
         }
