@@ -1,13 +1,11 @@
 package com.tooniboy
 
-import android.util.Base64
 import com.google.gson.JsonParser
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.USER_AGENT
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.base64Decode
-import com.lagradost.cloudstream3.extractors.VidHidePro
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -432,7 +430,7 @@ open class GDMirrorbot : ExtractorApi() {
                     pageText = app.get(apiUrl).text
 
                     val embedData = tryParseJson<GDEmbedData>(pageText)
-                    sidValue = embedData?.data?.firstOrNull()?.fileSlug
+                    sidValue = embedData?.data?.firstOrNull()?.fileslug
                         ?.takeIf { it.isNotBlank() } ?: sid
                 }
             } catch (e: Exception) {
@@ -462,20 +460,23 @@ open class GDMirrorbot : ExtractorApi() {
         val siteUrls = root.siteUrls ?: return
         val siteFriendlyNames = root.siteFriendlyNames
 
-        // mresult arrives either as JSON object or base64-encoded string
-        val mresult: Map<String, String>? = when {
-            root.mresult is Map<*, *> -> @Suppress("UNCHECKED_CAST") (root.mresult as Map<String, String>)
-            root.mresult is String -> try {
-                val decoded = base64Decode(root.mresult)
-                JsonParser.parseString(decoded).asJsonObject.let { jo ->
-                    jo.keySet().associateWith { jo[it]?.asString ?: "" }
-                }
+        // mresult arrives either as a JSON object or a base64-encoded string
+        val rawMresult = root.mresult
+        val mresult: Map<String, String> = when (rawMresult) {
+            is Map<*, *> -> @Suppress("UNCHECKED_CAST") (rawMresult as Map<String, String>)
+            is String -> try {
+                val decoded = base64Decode(rawMresult)
+                val jo = JsonParser.parseString(decoded).asJsonObject
+                jo.keySet().associateWith { jo[it]?.asString.orEmpty() }
             } catch (e: Exception) {
                 Log.e(name, "mresult decode failed: ${e.message}")
-                null
+                return
             }
-            else -> null
-        } ?: return
+            else -> {
+                Log.e(name, "mresult missing")
+                return
+            }
+        }
 
         siteUrls.keys.intersect(mresult.keys).forEach { key ->
             val base = siteUrls[key]?.trimEnd('/') ?: return@forEach
