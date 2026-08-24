@@ -1,11 +1,11 @@
 package com.tooniboy
 
-import android.util.Base64
 import com.google.gson.JsonParser
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.USER_AGENT
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.base64Decode
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -419,13 +419,12 @@ open class GDMirrorbot : ExtractorApi() {
         val siteUrls = root.siteUrls ?: return
         val siteFriendlyNames = root.siteFriendlyNames
 
-        // mresult: object OR base64 string
+        // mresult: object OR base64 string (cloudstream base64Decode = cross-platform safe)
         val rawMresult = root.mresult
         val mresult: Map<String, String> = when (rawMresult) {
             is Map<*, *> -> @Suppress("UNCHECKED_CAST") (rawMresult as Map<String, String>)
             is String -> try {
-                val decoded = Base64.decode(rawMresult, Base64.DEFAULT).toString(Charsets.UTF_8)
-                val jo = JsonParser.parseString(decoded).asJsonObject
+                val jo = JsonParser.parseString(base64Decode(rawMresult)).asJsonObject
                 jo.keySet().associateWith { jo[it]?.asString.orEmpty() }
             } catch (e: Exception) {
                 Log.e(name, "mresult decode failed: ${e.message}")
