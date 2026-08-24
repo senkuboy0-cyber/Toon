@@ -1,5 +1,6 @@
 package com.tooniboy
 
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.google.gson.Gson
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
@@ -7,6 +8,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLEncoder
 
 data class ToonMedia(
     val url: String,
@@ -19,6 +21,38 @@ data class ToonMedia(
  * trtype: 1 = movie, 2 = episode (toronites embed system)
  */
 data class EpisodeData(val url: String, val trtype: Int = 2)
+
+// ─── TMDB Data Classes ───
+data class TmdbImages(
+    @JsonProperty("logos") val logos: ArrayList<TmdbImage>? = null,
+    @JsonProperty("backdrops") val backdrops: ArrayList<TmdbImage>? = null
+)
+data class TmdbImage(
+    @JsonProperty("file_path") val filePath: String? = null,
+    @JsonProperty("iso_639_1") val lang: String? = null
+)
+data class TmdbFind(
+    @JsonProperty("movie_results") val movies: ArrayList<TmdbResult>? = null,
+    @JsonProperty("tv_results") val tvShows: ArrayList<TmdbResult>? = null
+)
+data class TmdbResult(
+    @JsonProperty("id") val id: Int? = null,
+    @JsonProperty("media_type") val mediaType: String? = null,
+    @JsonProperty("title") val title: String? = null,
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("release_date") val releaseDate: String? = null,
+    @JsonProperty("first_air_date") val firstAirDate: String? = null,
+    @JsonProperty("genre_ids") val genreIds: ArrayList<Int>? = null
+)
+data class TmdbSearch(
+    @JsonProperty("results") val results: ArrayList<TmdbResult>? = null
+)
+data class TmdbDetails(
+    val id: Int?,
+    val type: String?,
+    val logo: String?,
+    val backdrop: String?
+)
 
 open class Tooniboy : MainAPI() {
     override var mainUrl = "https://tooniboy.co"
@@ -34,6 +68,168 @@ open class Tooniboy : MainAPI() {
         TvType.AnimeMovie,
         TvType.Cartoon,
     )
+
+    // ─── TMDB (Logo + Backdrop only) ────────────────────────────
+    private val TMDB_API = "https://api.themoviedb.org/3"
+    private val TMDB_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+    private val TMDB_IMG = "https://image.tmdb.org/t/p/original"
+
+    private fun normalizeTitle(s: String?): String =
+        (s ?: "").replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
+
+    private fun getResultYear(result: TmdbResult): Int? {
+        val dateString = result.releaseDate ?: result.firstAirDate ?: return null
+        if (dateString.contains("-")) {
+            return dateString.substringBefore("-").toIntOrNull()
+        }
+        return null
+    }
+
+    private fun yearMatches(tmdbYear: Int?, siteYear: Int?): Boolean {
+        if (siteYear == null || tmdbYear == null) return true
+        val diff = tmdbYear - siteYear
+        return diff == 0 || diff == 1 || diff == -1
+    }
+
+    private fun pickBestResult(candidates: List<TmdbResult>, siteYear: Int?): TmdbResult? {
+        if (candidates.isEmpty()) return null
+
+        if (siteYear != null) {
+            val yearMatched = candidates.filter { yearMatches(getResultYear(it), siteYear) }
+            if (yearMatched.isNotEmpty()) {
+                if (yearMatched.size == 1) return yearMatched[0]
+                // Prefer animation genre (16)
+                return yearMatched.firstOrNull { it.genreIds?.contains(16) == true }
+                    ?: yearMatched[0]
+            }
+        }
+        return candidates[0]
+    }
+
+    /**
+     * Cleans site title for TMDB search: strips dub/sub markers
+     * and season suffixes that would break matching.
+     */
+    private fun cleanForTmdb(title: String): String {
+        var t = title
+            .replace(Regex("\\((?:[^)]*)(?:dub|sub|audio|hindi|english|japanese)(?:[^)]*)\\)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\[(?:[^]]*)(?:dub|sub|audio|hindi|english|japanese)(?:[^]]*)\\]", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s+Season\\s+\\d+.*$", RegexOption.IGNORE_CASE), "")
+            .trim()
+        return t.ifBlank { title }
+    }
+
+    /**
+     * Fetches ONLY logo + backdrop from TMDB.
+     * Matching: exact normalized title -> startsWith -> IMDB id fallback.
+     * Year ±1 filter, animation-genre preference.
+     */
+    private suspend fun fetchTmdbAssets(document: Document?, rawTitle: String, isSeries: Boolean, year: Int?): TmdbDetails {
+        return try {
+            val title = cleanForTmdb(rawTitle)
+            if (title.isBlank()) return TmdbDetails(null, null, null, null)
+
+            var tmdbId: Int? = null
+            var mediaType = if (isSeries) "tv" else "movie"
+
+            val safeTitle = URLEncoder.encode(title, "UTF-8")
+            val searchRes = app.get("$TMDB_API/search/multi?api_key=$TMDB_KEY&query=$safeTitle")
+                .parsedSafe<TmdbSearch>()
+
+            val validResults = searchRes?.results
+                ?.filter { it.mediaType == "movie" || it.mediaType == "tv" }
+                .orEmpty()
+
+            val normTitle = normalizeTitle(title)
+
+            // 1) Exact normalized-title match
+            val exactCandidates = validResults.filter {
+                normalizeTitle(it.title) == normTitle || normalizeTitle(it.name) == normTitle
+            }
+            val exactMatch = pickBestResult(exactCandidates, year)
+            if (exactMatch != null) {
+                tmdbId = exactMatch.id
+                exactMatch.mediaType?.let { mediaType = it }
+            }
+
+            // 2) startsWith match
+            if (tmdbId == null && normTitle.length >= 6) {
+                val startsWithCandidates = validResults.filter {
+                    (normalizeTitle(it.title).ifEmpty { normalizeTitle(it.name) }).startsWith(normTitle)
+                }
+                val swMatch = pickBestResult(startsWithCandidates, year)
+                if (swMatch != null) {
+                    tmdbId = swMatch.id
+                    swMatch.mediaType?.let { mediaType = it }
+                }
+            }
+
+            // 3) IMDB id fallback from page links
+            if (tmdbId == null && document != null) {
+                var imdbId: String? = null
+                for (link in document.select("a[href*='imdb.com/title']")) {
+                    val href = link.attr("href")
+                    if (href.contains("title/")) {
+                        val possibleId = href.substringAfter("title/").substringBefore("/")
+                        if (possibleId.startsWith("tt")) {
+                            imdbId = possibleId
+                            break
+                        }
+                    }
+                }
+                if (imdbId != null) {
+                    val findRes = app.get("$TMDB_API/find/$imdbId?api_key=$TMDB_KEY&external_source=imdb_id")
+                        .parsedSafe<TmdbFind>()
+                    val tvMatch = findRes?.tvShows?.firstOrNull()
+                    val movieMatch = findRes?.movies?.firstOrNull()
+
+                    val chosen: TmdbResult? = if (isSeries) tvMatch ?: movieMatch else movieMatch ?: tvMatch
+                    if (chosen != null) {
+                        tmdbId = chosen.id
+                        chosen.mediaType?.let { mediaType = it }
+                            ?: run { mediaType = if (isSeries) "tv" else "movie" }
+                    }
+                }
+            }
+
+            if (tmdbId == null) return TmdbDetails(null, null, null, null)
+
+            // ── Fetch images: logo + backdrop ──
+            val images = app.get("$TMDB_API/$mediaType/$tmdbId/images?api_key=$TMDB_KEY")
+                .parsedSafe<TmdbImages>()
+
+            var logoUrl: String? = null
+            var backdropUrl: String? = null
+
+            if (images != null) {
+                // Logo: skip SVGs; prefer en -> null-lang -> ja -> first
+                images.logos?.let { logos ->
+                    val validLogos = logos.filter { path ->
+                        val p = path.filePath ?: ""
+                        p.isNotEmpty() && !p.endsWith(".svg") && !p.endsWith(".SVG")
+                    }
+                    val bestLogo = validLogos.firstOrNull { it.lang == "en" }
+                        ?: validLogos.firstOrNull { it.lang == null }
+                        ?: validLogos.firstOrNull { it.lang == "ja" }
+                        ?: validLogos.firstOrNull()
+                    bestLogo?.filePath?.let { logoUrl = "$TMDB_IMG$it" }
+                }
+
+                // Backdrop: prefer null-lang -> en -> first
+                images.backdrops?.let { backs ->
+                    val bestBackdrop = backs.firstOrNull { it.lang == null }
+                        ?: backs.firstOrNull { it.lang == "en" }
+                        ?: backs.firstOrNull()
+                    bestBackdrop?.filePath?.let { backdropUrl = "$TMDB_IMG$it" }
+                }
+            }
+
+            TmdbDetails(tmdbId, mediaType, logoUrl, backdropUrl)
+        } catch (e: Exception) {
+            Log.e("Tooniboy", "TMDB failed: ${e.message}")
+            TmdbDetails(null, null, null, null)
+        }
+    }
 
     // ─── Helpers ────────────────────────────────────────────────
 
@@ -190,18 +386,21 @@ open class Tooniboy : MainAPI() {
             .filter { it.isNotBlank() }
         val isSeries = !movie && seasonLinks.isNotEmpty()
 
+        // ── TMDB: logo + backdrop only ──
+        val tmdb = fetchTmdbAssets(document, rawTitle, isSeries, year)
+
         return if (isSeries) {
-            loadSeries(media, document, rawTitle, poster, background, description, year, rating, seasonLinks, recommendations)
+            loadSeries(media, document, rawTitle, poster, background, description, year, rating, seasonLinks, recommendations, tmdb)
         } else {
-            // Movies play directly from their own page; trtype=1
             newMovieLoadResponse(rawTitle, url, TvType.Movie, Gson().toJson(EpisodeData(actualUrl, trtype = 1))) {
                 this.posterUrl = poster
-                this.backgroundPosterUrl = background ?: poster
+                this.backgroundPosterUrl = tmdb.backdrop ?: background ?: poster
                 this.plot = description
                 this.year = year
                 this.score = Score.from10(rating)
                 this.duration = parseDuration(duration)
                 this.recommendations = recommendations
+                this.logoUrl = tmdb.logo
             }
         }
     }
@@ -280,7 +479,8 @@ open class Tooniboy : MainAPI() {
         year: Int?,
         rating: Double?,
         seasonUrls: List<String>,
-        recommendations: List<SearchResponse>
+        recommendations: List<SearchResponse>,
+        tmdb: TmdbDetails
     ): LoadResponse {
         val episodes = mutableListOf<Episode>()
         val seasonSlugRegex = Regex("/season/(.+)-(\\d+)/?$")
@@ -333,11 +533,12 @@ open class Tooniboy : MainAPI() {
 
         return newTvSeriesLoadResponse(title, Gson().toJson(media), TvType.TvSeries, episodes) {
             this.posterUrl = poster
-            this.backgroundPosterUrl = background ?: poster
+            this.backgroundPosterUrl = tmdb.backdrop ?: background ?: poster
             this.plot = description
             this.year = year
             this.score = Score.from10(rating)
             this.recommendations = recommendations
+            this.logoUrl = tmdb.logo
         }
     }
 
