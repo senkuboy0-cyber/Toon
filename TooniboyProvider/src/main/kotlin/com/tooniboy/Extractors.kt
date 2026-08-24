@@ -79,72 +79,6 @@ open class AWSStream : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 0: SHORT → abyssplayer.com  (enc-dec.app decrypt)
-// ─────────────────────────────────────────────────────────────
-class Abyss : ExtractorApi() {
-    override var name = "Abyss"
-    override var mainUrl = "https://abyssplayer.com"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val headers = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Origin" to "https://playhydrax.com",
-            "Referer" to "https://playhydrax.com/"
-        )
-
-        val document = app.get(url, headers = headers).document
-        val scripts = document.select("script").joinToString("\n") { it.data() }
-
-        val encrypted = Regex("const\\s+datas\\s*=\\s*\"([^\"]*)\"")
-            .find(scripts)?.groupValues?.getOrNull(1) ?: return
-
-        val decrypted = app.post(
-            url = "https://enc-dec.app/api/dec-abyss",
-            headers = headers,
-            requestBody = """
-        {
-            "text": "$encrypted"
-        }
-    """.trimIndent().toRequestBody(
-                okhttp3.MediaType.Companion.run { "application/json".toMediaType() }
-            )
-        ).parsedSafe<AbyssResponse>()?.result ?: return
-
-        decrypted.sources
-            .filter { it.status }
-            .forEach { source ->
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name [${source.codec.uppercase()}]",
-                        url = source.url,
-                        type = INFER_TYPE
-                    ) {
-                        this.quality = getQualityFromName(source.type)
-                        this.headers = mapOf("Referer" to "https://playhydrax.com/")
-                    }
-                )
-            }
-    }
-
-    data class AbyssResponse(val status: Long, val result: Result)
-    data class Result(val sources: List<AbyssSource>)
-    data class AbyssSource(
-        val url: String,
-        val size: Long,
-        val type: String,
-        val codec: String,
-        val status: Boolean,
-    )
-}
-
-// ─────────────────────────────────────────────────────────────
 // Key 1: RUBY → rubystm.com  (/dl POST + JS unpack)
 // ─────────────────────────────────────────────────────────────
 class StreamRuby : ExtractorApi() {
@@ -200,7 +134,7 @@ class StreamRuby : ExtractorApi() {
 // API returns AES-CBC encrypted hex JSON.
 // Video: hlsVideoTiktok path + streamingConfig.adjust.Tiktok domain & v param
 // Verified live: full URL = https://{domain}{path}?v={ts}
-// NOTE: tiktokcdn blocks DATACENTER IPs (Akamai) but works on
+// NOTE: tiktokcdn (Akamai) blocks DATACENTER IPs but works on
 // residential/mobile connections — normal for Cloudstream users.
 // ─────────────────────────────────────────────────────────────
 class Cloudy : UpnsPlayer() {
@@ -273,12 +207,11 @@ open class UpnsPlayer : ExtractorApi() {
         // Parse streamingConfig: {"adjust":{"Tiktok":{"domain":"...","params":{"v":"..."}}}}
         var finalUrl = ""
         try {
-            val cfgRaw = obj.optJSONObject("streamingConfig")?.toString()
-                ?: obj.optString("streamingConfig")
+            val cfgObj = obj.optJSONObject("streamingConfig")
+            val cfgRaw = cfgObj?.toString() ?: obj.optString("streamingConfig")
             if (!cfgRaw.isNullOrBlank()) {
                 val cfg = JSONObject(cfgRaw)
                 val adjust = cfg.optJSONObject("adjust")
-                // iterate providers in order until we find an enabled one with a domain
                 val order = cfg.optJSONArray("order")
                 val candidates = mutableListOf<JSONObject>()
                 if (order != null) {
@@ -358,7 +291,7 @@ open class UpnsPlayer : ExtractorApi() {
 
 // ─────────────────────────────────────────────────────────────
 // Keys 3-4: SD/HD → gdmirrorbot.nl  (embedhelper sid API)
-// Key 5: FHD → fgdmirrorbot.nl (fallback to main host if down)
+// Key 5: FHD → fgdmirrorbot.nl
 // ─────────────────────────────────────────────────────────────
 open class GDMirrorbot : ExtractorApi() {
     override var name = "GDMirrorbot"
@@ -425,7 +358,8 @@ open class GDMirrorbot : ExtractorApi() {
         val mresult: Map<String, String> = when (rawMresult) {
             is Map<*, *> -> @Suppress("UNCHECKED_CAST") (rawMresult as Map<String, String>)
             is String -> try {
-                val jo = JsonParser.parseString(android.util.Base64.decode(rawMresult, android.util.Base64.DEFAULT).toString(Charsets.UTF_8)).asJsonObject
+                val decoded = Base64.decode(rawMresult, Base64.DEFAULT).toString(Charsets.UTF_8)
+                val jo = JsonParser.parseString(decoded).asJsonObject
                 jo.keySet().associateWith { jo[it]?.asString.orEmpty() }
             } catch (e: Exception) {
                 Log.e(name, "mresult decode failed: ${e.message}")
