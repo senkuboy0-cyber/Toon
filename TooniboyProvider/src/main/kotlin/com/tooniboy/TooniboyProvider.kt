@@ -14,7 +14,11 @@ data class ToonMedia(
     val title: String? = null,
 )
 
-data class EpisodeData(val url: String)
+/**
+ * Watchable page URL + its type.
+ * trtype: 1 = movie, 2 = episode (toronites embed system)
+ */
+data class EpisodeData(val url: String, val trtype: Int = 2)
 
 open class Tooniboy : MainAPI() {
     override var mainUrl = "https://tooniboy.co"
@@ -54,6 +58,9 @@ open class Tooniboy : MainAPI() {
         else -> TvType.TvSeries
     }
 
+    private fun isMovieUrl(url: String): Boolean =
+        url.contains("/movies/") || url.contains("/movie/")
+
     /**
      * Universal card parser for toroflix theme.
      * Cards: <li class="TPostMv ..."><article class="TPost B"><a href>...
@@ -81,7 +88,6 @@ open class Tooniboy : MainAPI() {
         val home = mutableListOf<SearchResponse>()
         val seen = mutableSetOf<String>()
 
-        // li.TPostMv is the card root; article.TPost.B inside it. Dedup by href.
         val elements = document.select(
             "li.TPostMv, div.TPost.B, article.TPost.B"
         )
@@ -120,7 +126,6 @@ open class Tooniboy : MainAPI() {
         val document = app.get(url).document
         val home = parseCardList(document)
 
-        // toroflix pagination: <nav class="wp-pagenavi"> with page links / fa-arrow-right
         val hasNext = document.selectFirst(
             "nav.wp-pagenavi a, a.next.page-numbers, link[rel=next], .pagination .next"
         ) != null
@@ -153,7 +158,7 @@ open class Tooniboy : MainAPI() {
         }
 
         val actualUrl = media.url
-        val isMovieUrl = actualUrl.contains("/movies/") || actualUrl.contains("/movie/")
+        val movie = isMovieUrl(actualUrl)
         val document = app.get(actualUrl).document
 
         // ── Title ──
@@ -168,7 +173,7 @@ open class Tooniboy : MainAPI() {
         val background = fixUrlNull(document.selectFirst("figure.Objf img.TPostBg")?.attr("src"))
         val poster = media.poster ?: background
 
-        // ── Description (robust against image-only paragraphs) ──
+        // ── Description ──
         val description = extractDescription(document)
 
         // ── Meta ──
@@ -176,19 +181,20 @@ open class Tooniboy : MainAPI() {
         val rating = document.selectFirst("div.post-ratings span")?.text()?.trim()?.toDoubleOrNull()
         val duration = document.selectFirst("span.Time")?.text()?.trim()
 
-        // ── Recommendations: "More titles like this" section only ──
+        // ── Recommendations ──
         val recommendations = parseRecommendations(document)
 
         // ── Series detection: real season links required ──
         val seasonLinks = document.select("section.SeasonBx .Title a[href*='/season/']")
             .map { fixUrl(it.attr("href")) }
             .filter { it.isNotBlank() }
-        val isSeries = !isMovieUrl && seasonLinks.isNotEmpty()
+        val isSeries = !movie && seasonLinks.isNotEmpty()
 
         return if (isSeries) {
             loadSeries(media, document, rawTitle, poster, background, description, year, rating, seasonLinks, recommendations)
         } else {
-            newMovieLoadResponse(rawTitle, url, TvType.Movie, Gson().toJson(EpisodeData(actualUrl))) {
+            // Movies play directly from their own page; trtype=1
+            newMovieLoadResponse(rawTitle, url, TvType.Movie, Gson().toJson(EpisodeData(actualUrl, trtype = 1))) {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = background ?: poster
                 this.plot = description
@@ -222,7 +228,6 @@ open class Tooniboy : MainAPI() {
             if (text.length > 20) return text
         }
 
-        // Fallback to meta description
         document.selectFirst("meta[name=description]")?.attr("content")?.let {
             if (it.isNotBlank()) return it.trim()
         }
@@ -230,8 +235,7 @@ open class Tooniboy : MainAPI() {
     }
 
     /**
-     * Parses ONLY the "More titles like this" carousel:
-     * section > div.Top > div.Title + div.MovieListTop.owl-carousel > div.TPostMv > div.TPost.B
+     * Parses ONLY the "More titles like this" carousel.
      */
     private fun parseRecommendations(document: Document): List<SearchResponse> {
         val recs = mutableListOf<SearchResponse>()
@@ -302,7 +306,7 @@ open class Tooniboy : MainAPI() {
                         .ifBlank { "Episode $epNum" }
 
                     episodes.add(
-                        newEpisode(Gson().toJson(EpisodeData(fixUrl(epLink)))) {
+                        newEpisode(Gson().toJson(EpisodeData(fixUrl(epLink), trtype = 2))) {
                             this.name = epName
                             this.posterUrl = epThumb
                             this.season = seasonNum
@@ -316,7 +320,7 @@ open class Tooniboy : MainAPI() {
                     val href = el.selectFirst("a[href*='/episode/']")?.attr("href") ?: continue
                     val name = cleanTitle(el.selectFirst("h2.Title")?.text() ?: "Episode $fallbackEp")
                     episodes.add(
-                        newEpisode(Gson().toJson(EpisodeData(fixUrl(href)))) {
+                        newEpisode(Gson().toJson(EpisodeData(fixUrl(href), trtype = 2))) {
                             this.name = name
                             this.season = seasonNum
                             this.episode = fallbackEp
@@ -354,15 +358,23 @@ open class Tooniboy : MainAPI() {
 
         val document = app.get(epData.url).document
 
-        // ── Server buttons: key + trid ──
+        // ── Server buttons carry data-typ (movie|episode), key and id ──
         val serverButtons = document.select("button[data-key][data-id]")
+
+        // trtype: movies use 1, episodes use 2. Detect from page, fallback to stored value.
+        val trtype = when {
+            serverButtons.isNotEmpty() && serverButtons.first().attr("data-typ") == "movie" -> 1
+            isMovieUrl(epData.url) -> 1
+            else -> epData.trtakeIfValid() ?: 2
+        }
+
         val trid = serverButtons.firstOrNull()?.attr("data-id")
             ?: document.selectFirst("[data-id]")?.attr("data-id")
             ?: Regex("""trid=(\d+)""").find(document.html())?.groupValues?.get(1)
 
         var success = false
 
-        // ── Default player (VidStreamX → animedekho embed → as-cdn26) ──
+        // ── Default player (VidStreamX → animedekho/as-cdn embed) ──
         val defaultIframe = document.selectFirst("div.Video.on > iframe[src]")
         defaultIframe?.attr("src")?.takeIf { it.isNotBlank() }?.let { src ->
             try {
@@ -379,13 +391,13 @@ open class Tooniboy : MainAPI() {
             }
         }
 
-        // ── trembed servers (key 0..8) ──
+        // ── trembed servers ──
         if (trid != null) {
             for (btn in serverButtons) {
                 val key = btn.attr("data-key").toIntOrNull() ?: continue
                 val label = btn.text().trim().ifBlank { "Server ${key + 1}" }
                 try {
-                    val embedDoc = app.get("$mainUrl/?trembed=$key&trid=$trid&trtype=2").document
+                    val embedDoc = app.get("$mainUrl/?trembed=$key&trid=$trid&trtype=$trtype").document
                     val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")
                         ?.replace("&amp;", "&")
                     if (!iframeSrc.isNullOrBlank()) {
@@ -401,6 +413,9 @@ open class Tooniboy : MainAPI() {
 
         return success
     }
+
+    private fun EpisodeData.trtakeIfValid(): Int? =
+        if (trtype == 1 || trtype == 2) trtype else null
 
     /**
      * Default VidStreamX player resolves through animedekho.app embed
