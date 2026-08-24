@@ -6,11 +6,10 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.base64Decode
 import com.lagradost.cloudstream3.extractors.VidStack
-import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import INFER_TYPE_PLACEHOLDER
+import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.getQualityFromName
@@ -18,9 +17,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
 import java.net.URI
-import java.net.URLEncoder
 
 // ─────────────────────────────────────────────────────────────
 // ★ Default: VidStreamX → as-cdn26.top  (AWSStream pattern)
@@ -300,10 +297,7 @@ open class GDMirrorbot : ExtractorApi() {
             val friendly = siteFriendlyNames?.get(key)?.asString ?: key
 
             try {
-                when (friendly) {
-                    "StreamHG", "EarnVids" -> loadExtractor(fullUrl, referer ?: mainUrl, subtitleCallback, callback)
-                    else -> loadExtractor(fullUrl, referer ?: mainUrl, subtitleCallback, callback)
-                }
+                loadExtractor(fullUrl, referer ?: mainUrl, subtitleCallback, callback)
             } catch (e: Exception) {
                 Log.e(name, "Failed $friendly at $fullUrl: ${e.message}")
             }
@@ -383,4 +377,136 @@ class VidMolyNet : ExtractorApi() {
             }
         )
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Key 8: MULTIQ → blakiteapi.xyz  (API → rumble CDN tar-HLS)
+// ─────────────────────────────────────────────────────────────
+class Blakite : ExtractorApi() {
+    override var name = "Blakite"
+    override var mainUrl = "https://blakiteapi.xyz"
+    override val requiresReferer = false
+
+    companion object {
+        private const val CDN_BASE = "https://hugh.cdn.rumble.cloud/video/"
+        // quality codes ↔ labels mapping from player.js
+        private val QUALITY_CODES = listOf("oaa", "baa", "caa", "gaa", "haa")
+        private val QUALITY_LABELS = listOf("240p", "360p", "480p", "720p", "1080p")
+    }
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        // URL format: https://blakiteapi.xyz/embed/{tmdbId}/{uniqueId}
+        // e.g. /embed/302051/1-1  or movie style /embed/{tmdbId}
+        val path = url.substringAfter("$mainUrl/embed/").trimEnd('/')
+
+        val tmdbId: String
+        val uniqueId: String?
+
+        if (path.contains("/")) {
+            tmdbId = path.substringBefore("/")
+            uniqueId = path.substringAfter("/")
+        } else {
+            tmdbId = path
+            uniqueId = null
+        }
+
+        val apiUrl = if (uniqueId != null) {
+            "$mainUrl/api/get.php?id=${URLEncoder.encode(uniqueId, "UTF-8")}&tmdbId=$tmdbId"
+        } else {
+            "$mainUrl/api/get.php?tmdbId=$tmdbId"
+        }
+
+        val json = try {
+            app.get(apiUrl).parsedSafe<BlakiteResponse>()
+        } catch (e: Exception) {
+            Log.e(name, "API failed: ${e.message}")
+            return
+        }
+
+        val data = json?.takeIf { it.success }?.data ?: return
+        val dataId = data.dataId ?: return
+
+        if (data.format.equals("M3U8", ignoreCase = true)) {
+            // Parse ranges: "39667200-39681123 (240p)\n726598656-726612902 (1080p)"
+            val rangeMap = mutableMapOf<String, String>()
+            data.ranges?.split("\n")?.forEach { line ->
+                val m = Regex("""(\d+-\d+)\s*\(([^)]+)\)""").find(line.trim())
+                if (m != null) {
+                    rangeMap[m.groupValues[2].trim()] = m.groupValues[1]
+                }
+            }
+
+            var emitted = false
+            for (i in QUALITY_LABELS.indices) {
+                val label = QUALITY_LABELS[i]
+                val code = QUALITY_CODES[i]
+                val range = rangeMap[label] ?: continue
+
+                val streamUrl = CDN_BASE +
+                    "$dataId.$code.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl&r_range=$range"
+
+                callback(
+                    newExtractorLink(name, "$name [$label]", streamUrl, ExtractorLinkType.M3U8) {
+                        this.referer = ""
+                        this.quality = getQualityFromName(label)
+                    }
+                )
+                emitted = true
+            }
+
+            // Fallback: no ranges parsed -> use qid count
+            if (!emitted) {
+                val qid = (data.qid ?: QUALITY_LABELS.size).coerceIn(1, QUALITY_LABELS.size)
+                for (i in 0 until qid) {
+                    val label = QUALITY_LABELS[i]
+                    val code = QUALITY_CODES[i]
+                    val streamUrl = CDN_BASE + "$dataId.$code.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl"
+                    callback(
+                        newExtractorLink(name, "$name [$label]", streamUrl, ExtractorLinkType.M3U8) {
+                            this.referer = ""
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                }
+            }
+        } else {
+            // MP4 format
+            val qid = (data.qid ?: 1).coerceIn(1, QUALITY_LABELS.size)
+            for (i in 0 until qid) {
+                val label = QUALITY_LABELS[i]
+                val code = QUALITY_CODES[i]
+                val streamUrl = "$CDN_BASE$dataId.$code.mp4"
+                callback(
+                    newExtractorLink(name, "$name [$label]", streamUrl, INFER_TYPE) {
+                        this.referer = ""
+                        this.quality = getQualityFromName(label)
+                    }
+                )
+            }
+        }
+    }
+
+    data class BlakiteResponse(
+        val success: Boolean = false,
+        val data: BlakiteData? = null,
+    )
+
+    data class BlakiteData(
+        val animeTitle: String? = null,
+        val tmdbId: String? = null,
+        val type: String? = null,
+        val seasonNumber: Int? = null,
+        val episodeNumber: Int? = null,
+        val title: String? = null,
+        val dataId: String? = null,
+        val qid: Int? = null,
+        val quality: String? = null,
+        val format: String? = null,
+        val ranges: String? = null,
+    )
 }
