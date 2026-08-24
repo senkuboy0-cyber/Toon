@@ -360,15 +360,16 @@ open class Tooniboy : MainAPI() {
 
         // ── Server buttons carry data-typ (movie|episode), key and id ──
         val serverButtons = document.select("button[data-key][data-id]")
+        val firstButton: Element? = serverButtons.firstOrNull()
 
         // trtype: movies use 1, episodes use 2. Detect from page, fallback to stored value.
         val trtype = when {
-            serverButtons.isNotEmpty() && serverButtons.first().attr("data-typ") == "movie" -> 1
+            firstButton != null && firstButton.attr("data-typ") == "movie" -> 1
             isMovieUrl(epData.url) -> 1
-            else -> epData.trtakeIfValid() ?: 2
+            else -> if (epData.trtype == 1 || epData.trtype == 2) epData.trtype else 2
         }
 
-        val trid = serverButtons.firstOrNull()?.attr("data-id")
+        val trid = firstButton?.attr("data-id")
             ?: document.selectFirst("[data-id]")?.attr("data-id")
             ?: Regex("""trid=(\d+)""").find(document.html())?.groupValues?.get(1)
 
@@ -413,9 +414,6 @@ open class Tooniboy : MainAPI() {
 
         return success
     }
-
-    private fun EpisodeData.trtakeIfValid(): Int? =
-        if (trtype == 1 || trtype == 2) trtype else null
 
     /**
      * Default VidStreamX player resolves through animedekho.app embed
