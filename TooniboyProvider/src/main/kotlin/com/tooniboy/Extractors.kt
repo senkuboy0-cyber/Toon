@@ -148,10 +148,8 @@ class Abyss : ExtractorApi() {
 // ─────────────────────────────────────────────────────────────
 // Key 1: RUBY → rubystm.com  (/dl POST + JS unpack)
 //
-// Reliability fixes:
-//  • 2 attempts: if /dl response lacks packed JS (CF challenge or
-//    stale clearance), re-visit /e/ page to refresh cookies, then retry
-//  • detects Cloudflare interstitial and logs it explicitly
+// Reliability: 2 attempts. If /dl lacks packed JS (CF challenge or
+// stale clearance), re-visit /e/ page to refresh cookies then retry.
 // ─────────────────────────────────────────────────────────────
 class StreamRuby : ExtractorApi() {
     override var name = "StreamRuby"
@@ -161,10 +159,10 @@ class StreamRuby : ExtractorApi() {
     companion object {
         private val PACKED_REGEX =
             Regex("""eval\(function\(p,a,c,k,e,d\)[\s\S]+?'\|'\)\)""")
+
         private fun isCfChallenge(html: String): Boolean =
-            html.contains("Just a moment", true) ||
-                html.contains("challenge-platform", true) ||
-                html.contains("cf-browser-verification", true)
+            html.contains("Just a moment", ignoreCase = true) ||
+                html.contains("challenge-platform", ignoreCase = true)
     }
 
     override suspend fun getUrl(
@@ -206,7 +204,7 @@ class StreamRuby : ExtractorApi() {
 
             if (isCfChallenge(html)) {
                 Log.e(name, "Cloudflare challenge hit (attempt ${attempt + 1})")
-                return@repeat   // retry after refreshing embed page
+                return@repeat   // retry after refreshing the embed page
             }
 
             val packed = PACKED_REGEX.find(html)?.value
@@ -235,34 +233,92 @@ class StreamRuby : ExtractorApi() {
             }
 
         callback(
-            newExtractorLink(source = name, name = name, url = C → cloudyns.one
+            newExtractorLink(source = name, name = name, url = m3u8, type = ExtractorLinkType.M3U8) {
+                this.referer = mainUrl
+                this.quality = Qualities.Unknown.value
+            }
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Key 2: CLOUDY → cloudy.upns.one
 // API returns AES-CBC encrypted hex JSON.
-// Video: hlsVideoTiktok path + streamingConfig.adjust.Tiktok domain & v param
-// Verified live: full URL = https://{domain}{path}?v={ts}
-// NOTE: tiktokcdn (Akamai) blocks DATENTER IPs but on/mobile — normal for Cloudstream users.
+// Video: hlsVideoTiktok path + streamingConfig.adjust.Tiktok domain & v param.
+// NOTE: tiktokcdn (Akamai) blocks DATACENTER IPs but works on
+// residential/mobile connections — normal for Cloudstream users.
 // ─────────────────────────────────────────────────────────────
 class Cloudy : UpnsPlayer() {
     override var name = "Cloudy"
     override var mainUrl = "https://cloudy.upns.one"
 }
 
-open UpnsPlayer :orApi() {
-    override var name = "Up"
-    override var main "upns.one"
-    override val requiresReferer =    companion object {
- private val AES_KEY "ua911ca"
+open class UpnsPlayer : ExtractorApi() {
+    override var name = "Upns"
+    override var mainUrl = "https://upns.one"
+    override val requiresReferer = true
+
+    companion object {
+        private const val AES_KEY = "kiemtienmua911ca"
         private const val AES_IV = "1234567890oiuytr"
     }
 
-    override suspend fun: refer:?,
-) callback("")
-        ifvideo {
-.e, "")
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val baseurl = getBaseUrl(url)
 
- }
+        // id from "#fragment" (cloudy.upns.one/#tye61y)
+        val hash = url.substringAfterLast("#").substringBefore("&").substringBefore("?")
+            .ifBlank { url.trimEnd('/').substringAfterLast('/') }
+        if (hash.isBlank()) return
 
-        //:Ttokdomainv var {
- objConfig")
+        val refHost = try {
+            URI(referer ?: mainUrl).host ?: mainUrl.removePrefix("https://")
+        } catch (e: Exception) {
+            mainUrl.removePrefix("https://")
+        }
+
+        val encoded = try {
+            app.get(
+                "$baseurl/api/v1/video?id=$hash&w=1280&h=720&r=$refHost",
+                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "*/*"),
+                referer = referer ?: "$baseurl/"
+            ).text.trim()
+        } catch (e: Exception) {
+            Log.e(name, "API failed: ${e.message}")
+            return
+        }
+        if (encoded.isBlank()) return
+
+        val decryptedJson = decryptHex(encoded) ?: run {
+            Log.e(name, "AES decrypt failed")
+            return
+        }
+
+        val obj = try {
+            JSONObject(decryptedJson)
+        } catch (e: Exception) {
+            Log.e(name, "JSON parse failed: ${e.message}")
+            return
+        }
+
+        // ── Build final stream URL from hlsVideoTiktok + streamingConfig ──
+        var videoPath = obj.optString("hlsVideoTiktok")
+        if (videoPath.isEmpty()) videoPath = obj.optString("source")
+        if (videoPath.isEmpty()) videoPath = obj.optString("hls")
+        if (videoPath.isEmpty()) {
+            Log.e(name, "no video path in response")
+            return
+        }
+
+        // Parse streamingConfig: {"adjust":{"Tiktok":{"domain":"...","params":{"v":"..."}}}}
+        var finalUrl = ""
+        try {
+            val cfgObj = obj.optJSONObject("streamingConfig")
             val cfgRaw = cfgObj?.toString() ?: obj.optString("streamingConfig")
             if (!cfgRaw.isNullOrBlank()) {
                 val cfg = JSONObject(cfgRaw)
@@ -274,9 +330,21 @@ open UpnsPlayer :orApi() {
                         adjust?.optJSONObject(order.getString(i))?.let { candidates.add(it) }
                     }
                 } else {
-                    adjust?.keys()?.forEach { k -> adjust.opt(it (()) sb)
-                    if (params != null params  val                       
-.hasNext k = keys.next("&")
+                    adjust?.keys()?.forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
+                }
+                for (c in candidates) {
+                    if (c.optBoolean("disabled", false)) continue
+                    val domain = c.optString("domain")
+                    if (domain.isBlank()) continue
+                    val sb = StringBuilder("https://").append(domain).append(videoPath)
+                    val params = c.optJSONObject("params")
+                    if (params != null && params.length() > 0) {
+                        sb.append("?")
+                        val keys = params.keys()
+                        var first = true
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            if (!first) sb.append("&")
                             sb.append(k).append("=").append(params.optString(k))
                             first = false
                         }
@@ -294,8 +362,17 @@ open UpnsPlayer :orApi() {
             finalUrl = "$baseurl$videoPath"
         }
 
-       (
-Link(name, name, url =.M.quality           :hi                  Path("#").firstOrNull().orEmpty()
+        callback(
+            newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
+                this.referer = "$baseurl/"
+                this.quality = Qualities.Unknown.value
+            }
+        )
+
+        // Subtitles: {"subtitle":{"en":"/xxx/en.vtt#en","hi":"..."}}
+        val subs = obj.optJSONObject("subtitle")
+        subs?.keys()?.forEach { lang ->
+            val rawPath = subs.optString(lang).split("#").firstOrNull().orEmpty()
             if (rawPath.isNotBlank()) {
                 val subUrl = if (rawPath.startsWith("http")) rawPath else "$baseurl$rawPath"
                 subtitleCallback(SubtitleFile(lang.uppercase(), subUrl))
@@ -326,20 +403,15 @@ Link(name, name, url =.M.quality           :hi                  Path("#").firstO
 // ─────────────────────────────────────────────────────────────
 // Keys 3-5: GDMirrorbot SD / HD / FHD   (app name: StreamHG)
 //
-// VERIFIED LIVE PIPELINE (works for all three qualities):
-//  1. GET  https://gdmirrorbot.nl/embed/{sid}     ← ALWAYS root domain!
-//     → redirects to a player origin e.g. pro.iqsmartgames.com/svid/...
-//  2. POST {playerOrigin}/embedhelper2.php
-//       sid={sid}&UserFavSite=&currentDomain={playerHost}
-//     → JSON { sources:{smwh,strmp2,flmn,flls}, mresult: base64 }
-//  3. mresult decoded → {"smwh":"id","strmp2":"id","flmn":"id","flls":"id"}
-//  4. smwh (StreamHG) → hanerix.com packed JS → hls2/hls3/hls4 links
-//  5. strmp2 (StreamP2P) → cloudy.p2pplay.pro/#{id} → UpnsPlayer
+// VERIFIED LIVE PIPELINE:
+//  1. GET  gdmirrorbot.nl/embed/{sid}  → redirect → player origin
+//  2. POST {origin}/embedhelper2.php → sources + mresult(base64)
+//  3. mresult → mirror ids; smwh=StreamHG(hanerix), strmp2=P2P(upns)
 //
-// Reliability fixes:
+// Reliability:
 //  • helper API retried once (re-resolving origin between attempts)
-//  • ALL working hls variants emitted: primary "StreamHG" +
-//    "StreamHG Backup" — different CDN domains go down independently,
+//  • ALL working hls variants emitted: primary "StreamHG" plus
+//    "StreamHG Backup" links — CDN domains go down independently;
 //    having both in the player list massively improves uptime
 //  • quality auto-detected from manifest RESOLUTION
 // ─────────────────────────────────────────────────────────────
@@ -472,43 +544,24 @@ open class GDMirrorbot : ExtractorApi() {
             try {
                 loadExtractor("${siteUrl.trimEnd('/')}/$evId", referer ?: mainUrl, subtitleCallback, callback)
             } catch (e: Exception) {
-                Log.d(name, "EarnVids unavailable: StreamHG: unpack Dean-Edwards packer, verify every hls candidate,
+                Log.d(name, "EarnVids unavailable: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * StreamHG: unpack Dean-Edwards packer, verify every hls candidate,
      * then emit PRIMARY + BACKUP links (independent CDNs — if one domain
-     * is blocked/slow on the user's network the other still plays).
-     */
-    private suspend fun extractStreamHg(
-        mirrorId: String,
-        callback: (        try {
-            app.get("$STREAMHG_BASE$mirrorId", referer = mainUrl).text
-        } catch (e: Exception) {
-            Log.e(name, "StreamHG page failed: ${e.message}")
-            return
-        }
+     * is html = failed")
+           
+ }
 
-        val packed = PACKED_REGEX.find(html)?.value ?: run {
-            Log.e(name, "StreamHG: no packed JS")
-            return
-        }
-        val unpacked = JsUnpacker(packed).unpack() ?: run {
-            Log.e(name, "StreamHG: unpack failed")
-            return
-        }
-
-        val hlsLinks = HLS_LINKS_REGEX.findAll(unpacked)
-            .associate { it.groupValues[1] to it.groupValues[2] }
-        if (hlsLinks.isEmpty()) {
-            Log.e(name, "StreamHG: no hls links found")
-            return
-        }
-
-        // Verify every candidate; collect working ones in priority order
-        data class Working(val url: String, val body: String)
+        val hlsLinks = HLS_LINK priority order
+        data Working(val url: String, val body: String)
 
         val working = mutableListOf<Pair<String, Working>>()
         for (key in HLS_PRIORITY) {
-            val candidate = hlsLinks[key] ?: continue
-            try {
-                val body = app.get(candidate, referer = STREAMHG_BASE).text
+            val candidate = hlsLinks[key referer = STREAMHG_BASE).text
                 if (body.contains("#EXTM3U")) {
                     working.add(key to Working(candidate, body))
                 }
@@ -529,17 +582,32 @@ open class GDMirrorbot : ExtractorApi() {
             return
         }
 
-        // Primary
-        val (primaryKey, primary) = working.first()
+        // Primary link
+        val primary = working.first()
         callback(
-            newExtractorLink(name, name, url = primary.url, type = ExtractorLinkType.M3U8) {
+            newExtractorLink(name, name, url = primary.second.url, type = ExtractorLinkType.M3U8) {
                 this.referer = STREAMHG_BASE
-                this.quality = qualityFromBody(primary.body)
+                this.quality = qualityFromBody(primary.second.body)
             }
         )
 
-        // Backup(s)                newExtractorLink(name, "$name Backup", url = w.url, type =) {
-                    this.referer480 Qualities.P480.value
+        // Backup link(s) — different CDN domain, same video
+        working.drop(1).forEach { w ->
+            callback(
+                newExtractorLink(name, "$name Backup", url = w.second.url, type = ExtractorLinkType.M3U8) {
+                    this.referer = STREAMHG_BASE
+                    this.quality = qualityFromBody(w.second.body)
+                }
+            )
+        }
+    }
+
+    private fun qualityFromBody(body: String?): Int = when {
+        body == null -> Qualities.Unknown.value
+        body.contains("1920x1080") -> Qualities.P1080.value
+        body.contains("1280x720") -> Qualities.P720.value
+        body.contains("856x480") || body.contains("854x480") ||
+            body.contains("640x360") -> Qualities.P480.value
         else -> Qualities.Unknown.value
     }
 
@@ -581,7 +649,6 @@ class EmTurboVid : ExtractorApi() {
 
     override suspend fun getUrl(
         url: String,
-        referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
