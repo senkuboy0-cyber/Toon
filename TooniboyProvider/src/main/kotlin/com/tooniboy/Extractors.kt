@@ -373,9 +373,11 @@ open class UpnsPlayer : ExtractorApi() {
 //
 // Quality auto-detected from manifest RESOLUTION:
 //   856x480 → 480p | 1280x720 → 720p | 1920x1080 → 1080p
+//
+// App display name: StreamHG (the mirror that actually serves the video)
 // ─────────────────────────────────────────────────────────────
 open class GDMirrorbot : ExtractorApi() {
-    override var name = "GDMirrorbot"
+    override var name = "StreamHG"
     override var mainUrl = "https://gdmirrorbot.nl"
     override val requiresReferer = true
 
@@ -594,7 +596,7 @@ open class GDMirrorbot : ExtractorApi() {
 }
 
 class GDMirrorbotFHD : GDMirrorbot() {
-    override var name = "GDMirrorbotFHD"
+    override var name = "StreamHG FHD"
     override var mainUrl = "https://gdmirrorbot.nl"   // same root; sid differs
 }
 
