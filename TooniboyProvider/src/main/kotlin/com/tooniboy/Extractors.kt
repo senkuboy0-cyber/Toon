@@ -16,6 +16,7 @@ import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.nicehttp.Session
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -25,7 +26,7 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 // ─────────────────────────────────────────────────────────────
-// ★ Default: VidStreamX → as-cdn26.top  (AWSStream pattern)
+// Key 0: AWSStream
 // ─────────────────────────────────────────────────────────────
 class Zephyrflick : AWSStream() {
     override val name = "Zephyrflick"
@@ -81,7 +82,7 @@ open class AWSStream : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 0: SHORT → abyssplayer.com  (enc-dec.app decrypt)
+// Key 1: Abyss
 // ─────────────────────────────────────────────────────────────
 class Abyss : ExtractorApi() {
     override var name = "Abyss"
@@ -145,8 +146,7 @@ class Abyss : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 1: RUBY → rubystm.com  (/dl POST + JS unpack)
-// Fixed: Added timestamp and cache-control headers to bypass cache
+// Key 2: StreamRuby
 // ─────────────────────────────────────────────────────────────
 class StreamRuby : ExtractorApi() {
     override var name = "StreamRuby"
@@ -162,31 +162,19 @@ class StreamRuby : ExtractorApi() {
         val fileCode = url.substringAfterLast("/e/").substringBefore(".html")
         if (fileCode.isBlank()) return
 
-        val timestamp = System.currentTimeMillis()
-        val embedUrl = "$mainUrl/e/$fileCode.html?t=$timestamp"
+        val session = Session()
 
-        app.get(
-            url = embedUrl,
-            headers = mapOf(
-                "Cache-Control" to "no-cache",
-                "Pragma" to "no-cache"
-            ),
-            referer = referer ?: mainUrl
-        )
+        session.get("$mainUrl/e/$fileCode.html", referer = referer ?: mainUrl)
 
-        val html = app.post(
-            url = "$mainUrl/dl?t=$timestamp",
+        val html = session.post(
+            url = "$mainUrl/dl",
             data = mapOf(
                 "op" to "embed",
                 "file_code" to fileCode,
                 "auto" to "1",
                 "referer" to (referer ?: "")
             ),
-            headers = mapOf(
-                "Cache-Control" to "no-cache",
-                "Pragma" to "no-cache"
-            ),
-            referer = embedUrl
+            referer = "$mainUrl/e/$fileCode.html"
         ).text
 
         val packed = Regex("""eval\(function\(p,a,c,k,e,d\)[\s\S]+?'\|'\)\)""")
@@ -211,7 +199,7 @@ class StreamRuby : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 2: CLOUDY → cloudy.upns.one
+// Key 3: Cloudy & UpnsPlayer
 // ─────────────────────────────────────────────────────────────
 class Cloudy : UpnsPlayer() {
     override var name = "Cloudy"
@@ -361,8 +349,7 @@ open class UpnsPlayer : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Keys 3-5: GDMirrorbot SD / HD / FHD
-// Fixed: Added timestamp and cache-control headers to bypass cache
+// Key 4: GDMirrorbot
 // ─────────────────────────────────────────────────────────────
 open class GDMirrorbot : ExtractorApi() {
     override var name = "StreamHG"
@@ -386,17 +373,10 @@ open class GDMirrorbot : ExtractorApi() {
         val sid = url.substringAfterLast("embed/").substringBefore("?").trimEnd('/')
         if (sid.isBlank()) return
 
-        val timestamp = System.currentTimeMillis()
+        val session = Session()
 
         val resolved = try {
-            app.get(
-                url = "$mainUrl/embed/$sid?t=$timestamp",
-                headers = mapOf(
-                    "Cache-Control" to "no-cache",
-                    "Pragma" to "no-cache"
-                ),
-                referer = referer ?: mainUrl
-            )
+            session.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl)
         } catch (e: Exception) {
             Log.e(name, "embed resolve failed: ${e.message}")
             return
@@ -411,8 +391,8 @@ open class GDMirrorbot : ExtractorApi() {
         }
 
         val responseText = try {
-            app.post(
-                url = "$playerOrigin/embedhelper2.php?t=$timestamp",
+            session.post(
+                "$playerOrigin/embedhelper2.php",
                 data = mapOf(
                     "sid" to sid,
                     "UserFavSite" to "",
@@ -422,8 +402,6 @@ open class GDMirrorbot : ExtractorApi() {
                     "Referer" to "$mainUrl/embed/$sid",
                     "Origin" to playerOrigin,
                     "X-Requested-With" to "XMLHttpRequest",
-                    "Cache-Control" to "no-cache",
-                    "Pragma" to "no-cache"
                 )
             ).text
         } catch (e: Exception) {
@@ -454,7 +432,7 @@ open class GDMirrorbot : ExtractorApi() {
 
         mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { smwhId ->
             try {
-                extractStreamHg(smwhId, subtitleCallback, callback)
+                extractStreamHg(smwhId, session, subtitleCallback, callback)
             } catch (e: Exception) {
                 Log.e(name, "StreamHG failed: ${e.message}")
             }
@@ -488,19 +466,12 @@ open class GDMirrorbot : ExtractorApi() {
 
     private suspend fun extractStreamHg(
         mirrorId: String,
+        session: Session,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val ts = System.currentTimeMillis()
         val html = try {
-            app.get(
-                url = "$STREAMHG_BASE$mirrorId?t=$ts",
-                headers = mapOf(
-                    "Cache-Control" to "no-cache",
-                    "Pragma" to "no-cache"
-                ),
-                referer = mainUrl
-            ).text
+            session.get("$STREAMHG_BASE$mirrorId", referer = mainUrl).text
         } catch (e: Exception) {
             Log.e(name, "StreamHG page failed: ${e.message}")
             return
@@ -527,7 +498,7 @@ open class GDMirrorbot : ExtractorApi() {
         for (key in listOf("hls2", "hls4", "hls3", "hls1")) {
             val candidate = hlsLinks[key] ?: continue
             try {
-                val body = app.get(candidate, referer = STREAMHG_BASE).text
+                val body = session.get(candidate, referer = STREAMHG_BASE).text
                 if (body.contains("#EXTM3U")) {
                     chosenUrl = candidate
                     manifestBody = body
@@ -589,7 +560,7 @@ class GDMirrorbotFHD : GDMirrorbot() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 6: TURBO → emturbovid.com  (data-hash attribute)
+// Key 5: EmTurboVid
 // ─────────────────────────────────────────────────────────────
 class EmTurboVid : ExtractorApi() {
     override var name = "EmTurboVid"
@@ -630,7 +601,7 @@ class EmTurboVid : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 7: VIDMOLY → vidmoly.net  (jwplayer file regex)
+// Key 6: VidMolyNet
 // ─────────────────────────────────────────────────────────────
 class VidMolyNet : ExtractorApi() {
     override var name = "VidMolyNet"
@@ -643,7 +614,8 @@ class VidMolyNet : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val txt = app.get(url, referer = referer ?: mainUrl).text
+        val session = Session()
+        val txt = session.get(url, referer = referer ?: mainUrl).text
 
         val m3u8 = Regex("""file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]""")
             .find(txt)?.groupValues?.get(1)
@@ -665,7 +637,7 @@ class VidMolyNet : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 8: MULTIQ → blakiteapi.xyz  (API → rumble CDN tar-HLS)
+// Key 7: Blakite
 // ─────────────────────────────────────────────────────────────
 class Blakite : ExtractorApi() {
     override var name = "Blakite"
@@ -799,3 +771,4 @@ class Blakite : ExtractorApi() {
         val ranges: String? = null,
     )
 }
+
