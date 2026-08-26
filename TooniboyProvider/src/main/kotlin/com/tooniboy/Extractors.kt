@@ -16,7 +16,6 @@ import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.nicehttp.Session
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -46,12 +45,12 @@ open class AWSStream : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val extractedHash = url.substringAfterLast("/")
-        val doc = app.get(url).document
+        val doc = app.get(url, cacheTime = 0).document
         val m3u8Url = "$mainUrl/player/index.php?data=$extractedHash&do=getVideo"
         val header = mapOf("x-requested-with" to "XMLHttpRequest")
         val formdata = mapOf("hash" to extractedHash, "r" to mainUrl)
 
-        val response = app.post(m3u8Url, headers = header, data = formdata).parsedSafe<Response>()
+        val response = app.post(m3u8Url, headers = header, data = formdata, cacheTime = 0).parsedSafe<Response>()
         response?.videoSource?.let { m3u8 ->
             callback.invoke(
                 newExtractorLink(name, name, url = m3u8, type = ExtractorLinkType.M3U8) {
@@ -101,7 +100,7 @@ class Abyss : ExtractorApi() {
             "Referer" to "https://playhydrax.com/"
         )
 
-        val document = app.get(url, headers = headers).document
+        val document = app.get(url, headers = headers, cacheTime = 0).document
         val scripts = document.select("script").joinToString("\n") { it.data() }
 
         val encrypted = Regex("const\\s+datas\\s*=\\s*\"([^\"]*)\"")
@@ -114,7 +113,8 @@ class Abyss : ExtractorApi() {
         {
             "text": "$encrypted"
         }
-    """.trimIndent().toRequestBody("application/json".toMediaType())
+    """.trimIndent().toRequestBody("application/json".toMediaType()),
+            cacheTime = 0
         ).parsedSafe<AbyssResponse>()?.result ?: return
 
         decrypted.sources
@@ -162,11 +162,9 @@ class StreamRuby : ExtractorApi() {
         val fileCode = url.substringAfterLast("/e/").substringBefore(".html")
         if (fileCode.isBlank()) return
 
-        val session = Session(app.baseClient)
+        app.get("$mainUrl/e/$fileCode.html", referer = referer ?: mainUrl, cacheTime = 0)
 
-        session.get("$mainUrl/e/$fileCode.html", referer = referer ?: mainUrl)
-
-        val html = session.post(
+        val html = app.post(
             url = "$mainUrl/dl",
             data = mapOf(
                 "op" to "embed",
@@ -174,7 +172,8 @@ class StreamRuby : ExtractorApi() {
                 "auto" to "1",
                 "referer" to (referer ?: "")
             ),
-            referer = "$mainUrl/e/$fileCode.html"
+            referer = "$mainUrl/e/$fileCode.html",
+            cacheTime = 0
         ).text
 
         val packed = Regex("""eval\(function\(p,a,c,k,e,d\)[\s\S]+?'\|'\)\)""")
@@ -238,7 +237,8 @@ open class UpnsPlayer : ExtractorApi() {
             app.get(
                 "$baseurl/api/v1/video?id=$hash&w=1280&h=720&r=$refHost",
                 headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "*/*"),
-                referer = referer ?: "$baseurl/"
+                referer = referer ?: "$baseurl/",
+                cacheTime = 0
             ).text.trim()
         } catch (e: Exception) {
             Log.e(name, "API failed: ${e.message}")
@@ -373,10 +373,8 @@ open class GDMirrorbot : ExtractorApi() {
         val sid = url.substringAfterLast("embed/").substringBefore("?").trimEnd('/')
         if (sid.isBlank()) return
 
-        val session = Session(app.baseClient)
-
         val resolved = try {
-            session.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl)
+            app.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl, cacheTime = 0)
         } catch (e: Exception) {
             Log.e(name, "embed resolve failed: ${e.message}")
             return
@@ -391,7 +389,7 @@ open class GDMirrorbot : ExtractorApi() {
         }
 
         val responseText = try {
-            session.post(
+            app.post(
                 "$playerOrigin/embedhelper2.php",
                 data = mapOf(
                     "sid" to sid,
@@ -402,7 +400,8 @@ open class GDMirrorbot : ExtractorApi() {
                     "Referer" to "$mainUrl/embed/$sid",
                     "Origin" to playerOrigin,
                     "X-Requested-With" to "XMLHttpRequest",
-                )
+                ),
+                cacheTime = 0
             ).text
         } catch (e: Exception) {
             Log.e(name, "embedhelper2 failed: ${e.message}")
@@ -432,7 +431,7 @@ open class GDMirrorbot : ExtractorApi() {
 
         mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { smwhId ->
             try {
-                extractStreamHg(smwhId, session, subtitleCallback, callback)
+                extractStreamHg(smwhId, subtitleCallback, callback)
             } catch (e: Exception) {
                 Log.e(name, "StreamHG failed: ${e.message}")
             }
@@ -466,12 +465,11 @@ open class GDMirrorbot : ExtractorApi() {
 
     private suspend fun extractStreamHg(
         mirrorId: String,
-        session: Session,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         val html = try {
-            session.get("$STREAMHG_BASE$mirrorId", referer = mainUrl).text
+            app.get("$STREAMHG_BASE$mirrorId", referer = mainUrl, cacheTime = 0).text
         } catch (e: Exception) {
             Log.e(name, "StreamHG page failed: ${e.message}")
             return
@@ -498,7 +496,7 @@ open class GDMirrorbot : ExtractorApi() {
         for (key in listOf("hls2", "hls4", "hls3", "hls1")) {
             val candidate = hlsLinks[key] ?: continue
             try {
-                val body = session.get(candidate, referer = STREAMHG_BASE).text
+                val body = app.get(candidate, referer = STREAMHG_BASE, cacheTime = 0).text
                 if (body.contains("#EXTM3U")) {
                     chosenUrl = candidate
                     manifestBody = body
@@ -573,7 +571,7 @@ class EmTurboVid : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val doc = app.get(url, referer = referer ?: mainUrl).document
+        val doc = app.get(url, referer = referer ?: mainUrl, cacheTime = 0).document
 
         var m3u8 = doc.selectFirst("#video_player[data-hash]")
             ?.attr("data-hash")
@@ -614,8 +612,7 @@ class VidMolyNet : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val session = Session(app.baseClient)
-        val txt = session.get(url, referer = referer ?: mainUrl).text
+        val txt = app.get(url, referer = referer ?: mainUrl, cacheTime = 0).text
 
         val m3u8 = Regex("""file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]""")
             .find(txt)?.groupValues?.get(1)
@@ -682,7 +679,8 @@ class Blakite : ExtractorApi() {
                     "Referer" to url,
                     "Accept" to "application/json",
                     "User-Agent" to USER_AGENT,
-                )
+                ),
+                cacheTime = 0
             ).parsedSafe<BlakiteResponse>()
         } catch (e: Exception) {
             Log.e(name, "API failed: ${e.message}")
