@@ -9,7 +9,7 @@
             "senkuboy0-cyber"
         ],
         "description": "Tooniboy: The best place for Hindi & Multi-language Anime, Cartoons and Movies.",
-        "fileSize": 80345,
+        "fileSize": 79538,
         "repositoryUrl": "https://github.com/senkuboy0-cyber/Toon",
         "language": "hi",
         "tvTypes": [
@@ -20,9 +20,9 @@
         ],
         "iconUrl": "https://tooniboy.co/wp-content/uploads/2024/03/cropped-tooniboy-high-resolution-logo-transparent-7.png",
         "apiVersion": 1,
-        "fileHash": "sha256-496df7df8178606a588659f940b791a07b1d2c1467cd1e7502b563650651eaf3",
-        "jarFileSize": 347179,
+        "fileHash": "sha256-30a8f4a52a8565b66a00e82a2541b2a8def836ff9b44a9fb4048218e1480066f",
+        "jarFileSize": 345427,
         "jarUrl": "https://raw.githubusercontent.com/senkuboy0-cyber/Toon/builds/TooniboyProvider.jar",
-        "jarHash": "sha256-3d09a48fcecb10ddfbf7dbb743f5c7a9c8022fafd36205e7046c2d89722675d9"
+        "jarHash": "sha256-8c4b1d0e038ca38b987664f50e1642c49921d25e4184d968fedc99dbada0a721"
     }
 ]
