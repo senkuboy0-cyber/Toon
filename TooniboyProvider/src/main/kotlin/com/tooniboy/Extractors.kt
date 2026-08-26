@@ -162,7 +162,7 @@ class StreamRuby : ExtractorApi() {
         val fileCode = url.substringAfterLast("/e/").substringBefore(".html")
         if (fileCode.isBlank()) return
 
-        val session = Session()
+        val session = Session(app.baseClient)
 
         session.get("$mainUrl/e/$fileCode.html", referer = referer ?: mainUrl)
 
@@ -373,7 +373,7 @@ open class GDMirrorbot : ExtractorApi() {
         val sid = url.substringAfterLast("embed/").substringBefore("?").trimEnd('/')
         if (sid.isBlank()) return
 
-        val session = Session()
+        val session = Session(app.baseClient)
 
         val resolved = try {
             session.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl)
@@ -614,7 +614,7 @@ class VidMolyNet : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val session = Session()
+        val session = Session(app.baseClient)
         val txt = session.get(url, referer = referer ?: mainUrl).text
 
         val m3u8 = Regex("""file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]""")
@@ -771,4 +771,3 @@ class Blakite : ExtractorApi() {
         val ranges: String? = null,
     )
 }
-
