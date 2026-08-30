@@ -16,6 +16,7 @@ import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.delay
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
@@ -23,6 +24,68 @@ import java.net.URI
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+
+// ─────────────────────────────────────────────────────────────
+// ★ Deferred Retry Manager: Handles queue-based retries.
+// It processes tasks once, skipping failures immediately. 
+// After all tasks are processed, it loops through the failed ones up to 5 times.
+// ─────────────────────────────────────────────────────────────
+object DeferredRetryManager {
+
+    suspend fun <T> processWithDeferredRetry(
+        items: List<T>,
+        maxRetries: Int = 5,
+        delayMs: Long = 1500L,
+        action: suspend (T) -> Boolean
+    ) {
+        var currentQueue = items.toList()
+        var attempt = 0
+
+        while (currentQueue.isNotEmpty() && attempt <= maxRetries) {
+            val nextQueue = mutableListOf<T>()
+
+            for (item in currentQueue) {
+                val success = try {
+                    action(item)
+                } catch (e: Exception) {
+                    false
+                }
+                
+                if (!success) {
+                    nextQueue.add(item)
+                }
+            }
+
+            currentQueue = nextQueue
+            if (currentQueue.isNotEmpty() && attempt < maxRetries) {
+                delay(delayMs)
+            }
+            attempt++
+        }
+    }
+
+    // Helper for main Provider to load multiple extractor URLs with the deferred queue logic
+    suspend fun loadMultipleUrlsWithDeferredRetry(
+        urls: List<String>,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        processWithDeferredRetry(urls, maxRetries = 5, delayMs = 2000L) { url ->
+            var isExtracted = false
+            val interceptingCallback: (ExtractorLink) -> Unit = { link ->
+                isExtracted = true
+                callback(link)
+            }
+            try {
+                loadExtractor(url, referer, subtitleCallback, interceptingCallback)
+            } catch (e: Exception) {
+                Log.e("DeferredRetry", "Extraction failed for $url: ${e.message}")
+            }
+            isExtracted
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // ★ Default: VidStreamX → as-cdn26.top  (AWSStream pattern)
@@ -197,11 +260,6 @@ class StreamRuby : ExtractorApi() {
 
 // ─────────────────────────────────────────────────────────────
 // Key 2: CLOUDY → cloudy.upns.one
-// API returns AES-CBC encrypted hex JSON.
-// Video: hlsVideoTiktok path + streamingConfig.adjust.Tiktok domain & v param
-// Verified live: full URL = https://{domain}{path}?v={ts}
-// NOTE: tiktokcdn (Akamai) blocks DATACENTER IPs but works on
-// residential/mobile connections — normal for Cloudstream users.
 // ─────────────────────────────────────────────────────────────
 class Cloudy : UpnsPlayer() {
     override var name = "Cloudy"
@@ -226,7 +284,6 @@ open class UpnsPlayer : ExtractorApi() {
     ) {
         val baseurl = getBaseUrl(url)
 
-        // id from "#fragment" (cloudy.upns.one/#tye61y)
         val hash = url.substringAfterLast("#").substringBefore("&").substringBefore("?")
             .ifBlank { url.trimEnd('/').substringAfterLast('/') }
         if (hash.isBlank()) return
@@ -261,7 +318,6 @@ open class UpnsPlayer : ExtractorApi() {
             return
         }
 
-        // ── Build final stream URL from hlsVideoTiktok + streamingConfig ──
         var videoPath = obj.optString("hlsVideoTiktok")
         if (videoPath.isEmpty()) videoPath = obj.optString("source")
         if (videoPath.isEmpty()) videoPath = obj.optString("hls")
@@ -270,7 +326,6 @@ open class UpnsPlayer : ExtractorApi() {
             return
         }
 
-        // Parse streamingConfig: {"adjust":{"Tiktok":{"domain":"...","params":{"v":"..."}}}}
         var finalUrl = ""
         try {
             val cfgObj = obj.optJSONObject("streamingConfig")
@@ -312,7 +367,6 @@ open class UpnsPlayer : ExtractorApi() {
             Log.e(name, "config parse failed: ${e.message}")
         }
 
-        // Fallback: serve path from own origin
         if (finalUrl.isEmpty()) {
             finalUrl = "$baseurl$videoPath"
         }
@@ -324,7 +378,6 @@ open class UpnsPlayer : ExtractorApi() {
             }
         )
 
-        // Subtitles: {"subtitle":{"en":"/xxx/en.vtt#en","hi":"..."}}
         val subs = obj.optJSONObject("subtitle")
         subs?.keys()?.forEach { lang ->
             val rawPath = subs.optString(lang).split("#").firstOrNull().orEmpty()
@@ -357,23 +410,7 @@ open class UpnsPlayer : ExtractorApi() {
 
 // ─────────────────────────────────────────────────────────────
 // Keys 3-5: GDMirrorbot SD / HD / FHD
-//
-// VERIFIED LIVE PIPELINE (works for all three qualities):
-//  1. GET  https://gdmirrorbot.nl/embed/{sid}     ← ALWAYS root domain!
-//     → redirects to a player origin e.g. pro.iqsmartgames.com/svid/...
-//  2. POST {playerOrigin}/embedhelper2.php
-//       sid={sid}&UserFavSite=&currentDomain={playerHost}
-//     → JSON { sources:{smwh,strmp2,flmn,flls}, mresult: base64 }
-//  3. mresult decoded → {"smwh":"id","strmp2":"id","flmn":"id","flls":"id"}
-//  4. smwh (StreamHG) → GET https://hanerix.com/e/{id}
-//     → Dean-Edwards packed JS → JsUnpacker → links.hls2/hls3
-//     → verify manifest (#EXTM3U) & read RESOLUTION for quality
-//  5. strmp2 (StreamP2P) → cloudy.p2pplay.pro/#{id} → UpnsPlayer
-//
-// Quality auto-detected from manifest RESOLUTION:
-//   856x480 → 480p | 1280x720 → 720p | 1920x1080 → 1080p
-//
-// App display name: StreamHG (the mirror that actually serves the video)
+// Implements Deferred Retry Manager for mirrors processing!
 // ─────────────────────────────────────────────────────────────
 open class GDMirrorbot : ExtractorApi() {
     override var name = "StreamHG"
@@ -394,12 +431,9 @@ open class GDMirrorbot : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Extract sid; FORCE root domain (fgdmirrorbot.nl is DNS-dead but
-        // its sids resolve fine on gdmirrorbot.nl)
         val sid = url.substringAfterLast("embed/").substringBefore("?").trimEnd('/')
         if (sid.isBlank()) return
 
-        // ── Step 1: resolve embed page → player origin ──
         val resolved = try {
             app.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl)
         } catch (e: Exception) {
@@ -415,7 +449,6 @@ open class GDMirrorbot : ExtractorApi() {
             return
         }
 
-        // ── Step 2: helper API v2 on the resolved player origin ──
         val responseText = try {
             app.post(
                 "$playerOrigin/embedhelper2.php",
@@ -440,7 +473,6 @@ open class GDMirrorbot : ExtractorApi() {
             return
         }
 
-        // mresult: object OR base64-encoded JSON string
         val rawMresult = root.mresult
         val mirrors: Map<String, String> = when (rawMresult) {
             is Map<*, *> -> @Suppress("UNCHECKED_CAST") (rawMresult as Map<String, String>)
@@ -457,51 +489,59 @@ open class GDMirrorbot : ExtractorApi() {
             }
         }
 
-        // ── Step 3: route each mirror ──
+        // ── Step 3: Compile tasks and process with DeferredRetryManager ──
+        val mirrorTasks = mutableListOf<Pair<String, String>>()
+        
+        mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add("smwh" to it) }
+        mirrors["strmp2"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add("strmp2" to it) }
+        mirrors["flls"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add("flls" to it) }
 
-        // smwh = StreamHG (hanerix.com) — PRIMARY, fully extractable
-        mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { smwhId ->
-            try {
-                extractStreamHg(smwhId, subtitleCallback, callback)
-            } catch (e: Exception) {
-                Log.e(name, "StreamHG failed: ${e.message}")
+        DeferredRetryManager.processWithDeferredRetry(
+            items = mirrorTasks,
+            maxRetries = 5,
+            delayMs = 1500L
+        ) { (type, mirrorId) ->
+            var isExtracted = false
+            val interceptingCallback: (ExtractorLink) -> Unit = { link ->
+                isExtracted = true
+                callback(link)
             }
-        }
 
-        // strmp2 = StreamP2P (upns-family player) → our UpnsPlayer
-        mirrors["strmp2"]?.takeIf { it.isNotBlank() }?.let { p2pId ->
-            val siteUrl = root.sources?.get("strmp2")?.siteUrl
-                ?: "https://cloudy.p2pplay.pro/#"
-            val fullUrl = if (siteUrl.endsWith("#")) "$siteUrl$p2pId"
-                          else "${siteUrl.trimEnd('/')}#$p2pId"
-            try {
-                UpnsPlayer().apply {
-                    this.name = "StreamP2P"
-                    this.mainUrl = getHost(fullUrl)
-                }.getUrl(fullUrl, referer, subtitleCallback, callback)
-            } catch (e: Exception) {
-                Log.e(name, "StreamP2P failed: ${e.message}")
+            when (type) {
+                "smwh" -> {
+                    try {
+                        extractStreamHg(mirrorId, subtitleCallback, interceptingCallback)
+                    } catch (e: Exception) {
+                        Log.e(name, "StreamHG failed: ${e.message}")
+                    }
+                }
+                "strmp2" -> {
+                    val siteUrl = root.sources?.get("strmp2")?.siteUrl ?: "https://cloudy.p2pplay.pro/#"
+                    val fullUrl = if (siteUrl.endsWith("#")) "$siteUrl$mirrorId"
+                                  else "${siteUrl.trimEnd('/')}#$mirrorId"
+                    try {
+                        UpnsPlayer().apply {
+                            this.name = "StreamP2P"
+                            this.mainUrl = getHost(fullUrl)
+                        }.getUrl(fullUrl, referer, subtitleCallback, interceptingCallback)
+                    } catch (e: Exception) {
+                        Log.e(name, "StreamP2P failed: ${e.message}")
+                    }
+                }
+                "flls" -> {
+                    val siteUrl = root.sources?.get("flls")?.siteUrl ?: "https://smoothpre.com/v/"
+                    try {
+                        loadExtractor("${siteUrl.trimEnd('/')}/$mirrorId", referer ?: mainUrl, subtitleCallback, interceptingCallback)
+                    } catch (e: Exception) {
+                        Log.d(name, "EarnVids unavailable: ${e.message}")
+                    }
+                }
             }
-        }
-
-        // flls (EarnVids) usually expired, flmn (Byse) captcha-protected:
-        // attempt generic extraction, failures are non-fatal
-        mirrors["flls"]?.takeIf { it.isNotBlank() }?.let { evId ->
-            val siteUrl = root.sources?.get("flls")?.siteUrl
-                ?: "https://smoothpre.com/v/"
-            try {
-                loadExtractor("${siteUrl.trimEnd('/')}/$evId", referer ?: mainUrl, subtitleCallback, callback)
-            } catch (e: Exception) {
-                Log.d(name, "EarnVids unavailable: ${e.message}")
-            }
+            
+            isExtracted 
         }
     }
 
-    /**
-     * StreamHG: unpack Dean-Edwards packer → pick first WORKING hls link
-     * (prefer .m3u8 variants, fall back to .txt master) → read manifest
-     * RESOLUTION for accurate quality label.
-     */
     private suspend fun extractStreamHg(
         mirrorId: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -530,7 +570,6 @@ open class GDMirrorbot : ExtractorApi() {
             return
         }
 
-        // Prefer real .m3u8 playlists; verify each until one responds
         var chosenUrl: String? = null
         var manifestBody: String? = null
         for (key in listOf("hls2", "hls4", "hls3", "hls1")) {
@@ -548,12 +587,10 @@ open class GDMirrorbot : ExtractorApi() {
         }
 
         val finalUrl = chosenUrl
-            // last resort: hand back unverified best-guess rather than nothing
             ?: hlsLinks["hls2"]
             ?: hlsLinks["hls3"]
             ?: return
 
-        // Quality from manifest RESOLUTION (fallback: Unknown)
         val quality = when {
             manifestBody == null -> Qualities.Unknown.value
             manifestBody.contains("1920x1080") -> Qualities.P1080.value
@@ -596,7 +633,7 @@ open class GDMirrorbot : ExtractorApi() {
 
 class GDMirrorbotFHD : GDMirrorbot() {
     override var name = "StreamHG"
-    override var mainUrl = "https://gdmirrorbot.nl"   // same root; sid differs
+    override var mainUrl = "https://gdmirrorbot.nl" 
 }
 
 // ─────────────────────────────────────────────────────────────
