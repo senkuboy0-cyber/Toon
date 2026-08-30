@@ -26,68 +26,6 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 // ─────────────────────────────────────────────────────────────
-// ★ Deferred Retry Manager: Handles queue-based retries.
-// It processes tasks once, skipping failures immediately. 
-// After all tasks are processed, it loops through the failed ones up to 5 times.
-// ─────────────────────────────────────────────────────────────
-object DeferredRetryManager {
-
-    suspend fun <T> processWithDeferredRetry(
-        items: List<T>,
-        maxRetries: Int = 5,
-        delayMs: Long = 1500L,
-        action: suspend (T) -> Boolean
-    ) {
-        var currentQueue = items.toList()
-        var attempt = 0
-
-        while (currentQueue.isNotEmpty() && attempt <= maxRetries) {
-            val nextQueue = mutableListOf<T>()
-
-            for (item in currentQueue) {
-                val success = try {
-                    action(item)
-                } catch (e: Exception) {
-                    false
-                }
-                
-                if (!success) {
-                    nextQueue.add(item)
-                }
-            }
-
-            currentQueue = nextQueue
-            if (currentQueue.isNotEmpty() && attempt < maxRetries) {
-                delay(delayMs)
-            }
-            attempt++
-        }
-    }
-
-    // Helper for main Provider to load multiple extractor URLs with the deferred queue logic
-    suspend fun loadMultipleUrlsWithDeferredRetry(
-        urls: List<String>,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        processWithDeferredRetry(urls, maxRetries = 5, delayMs = 2000L) { url ->
-            var isExtracted = false
-            val interceptingCallback: (ExtractorLink) -> Unit = { link ->
-                isExtracted = true
-                callback(link)
-            }
-            try {
-                loadExtractor(url, referer, subtitleCallback, interceptingCallback)
-            } catch (e: Exception) {
-                Log.e("DeferredRetry", "Extraction failed for $url: ${e.message}")
-            }
-            isExtracted
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
 // ★ Default: VidStreamX → as-cdn26.top  (AWSStream pattern)
 // ─────────────────────────────────────────────────────────────
 class Zephyrflick : AWSStream() {
@@ -410,7 +348,7 @@ open class UpnsPlayer : ExtractorApi() {
 
 // ─────────────────────────────────────────────────────────────
 // Keys 3-5: GDMirrorbot SD / HD / FHD
-// Implements Deferred Retry Manager for mirrors processing!
+// Implements a simple while-loop based Deferred Retry mechanism
 // ─────────────────────────────────────────────────────────────
 open class GDMirrorbot : ExtractorApi() {
     override var name = "StreamHG"
@@ -489,56 +427,58 @@ open class GDMirrorbot : ExtractorApi() {
             }
         }
 
-        // ── Step 3: Compile tasks and process with DeferredRetryManager ──
+        // ── Compile tasks ──
         val mirrorTasks = mutableListOf<Pair<String, String>>()
-        
-        mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add("smwh" to it) }
-        mirrors["strmp2"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add("strmp2" to it) }
-        mirrors["flls"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add("flls" to it) }
+        mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add(Pair("smwh", it)) }
+        mirrors["strmp2"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add(Pair("strmp2", it)) }
+        mirrors["flls"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add(Pair("flls", it)) }
 
-        DeferredRetryManager.processWithDeferredRetry(
-            items = mirrorTasks,
-            maxRetries = 5,
-            delayMs = 1500L
-        ) { (type, mirrorId) ->
-            var isExtracted = false
-            val interceptingCallback: (ExtractorLink) -> Unit = { link ->
-                isExtracted = true
-                callback(link)
-            }
+        // ── Simple Deferred Retry Loop ──
+        var currentQueue = mirrorTasks.toList()
+        var attempt = 0
+        val maxRetries = 5
 
-            when (type) {
-                "smwh" -> {
-                    try {
+        while (currentQueue.isNotEmpty() && attempt <= maxRetries) {
+            val nextQueue = mutableListOf<Pair<String, String>>()
+
+            for (task in currentQueue) {
+                val type = task.first
+                val mirrorId = task.second
+                var isExtracted = false
+
+                val interceptingCallback: (ExtractorLink) -> Unit = { link ->
+                    isExtracted = true
+                    callback.invoke(link)
+                }
+
+                try {
+                    if (type == "smwh") {
                         extractStreamHg(mirrorId, subtitleCallback, interceptingCallback)
-                    } catch (e: Exception) {
-                        Log.e(name, "StreamHG failed: ${e.message}")
-                    }
-                }
-                "strmp2" -> {
-                    val siteUrl = root.sources?.get("strmp2")?.siteUrl ?: "https://cloudy.p2pplay.pro/#"
-                    val fullUrl = if (siteUrl.endsWith("#")) "$siteUrl$mirrorId"
-                                  else "${siteUrl.trimEnd('/')}#$mirrorId"
-                    try {
-                        UpnsPlayer().apply {
-                            this.name = "StreamP2P"
-                            this.mainUrl = getHost(fullUrl)
-                        }.getUrl(fullUrl, referer, subtitleCallback, interceptingCallback)
-                    } catch (e: Exception) {
-                        Log.e(name, "StreamP2P failed: ${e.message}")
-                    }
-                }
-                "flls" -> {
-                    val siteUrl = root.sources?.get("flls")?.siteUrl ?: "https://smoothpre.com/v/"
-                    try {
+                    } else if (type == "strmp2") {
+                        val siteUrl = root.sources?.get("strmp2")?.siteUrl ?: "https://cloudy.p2pplay.pro/#"
+                        val fullUrl = if (siteUrl.endsWith("#")) "$siteUrl$mirrorId" else "${siteUrl.trimEnd('/')}#$mirrorId"
+                        val upns = UpnsPlayer()
+                        upns.name = "StreamP2P"
+                        upns.mainUrl = getHost(fullUrl)
+                        upns.getUrl(fullUrl, referer, subtitleCallback, interceptingCallback)
+                    } else if (type == "flls") {
+                        val siteUrl = root.sources?.get("flls")?.siteUrl ?: "https://smoothpre.com/v/"
                         loadExtractor("${siteUrl.trimEnd('/')}/$mirrorId", referer ?: mainUrl, subtitleCallback, interceptingCallback)
-                    } catch (e: Exception) {
-                        Log.d(name, "EarnVids unavailable: ${e.message}")
                     }
+                } catch (e: Exception) {
+                    Log.e(name, "Extraction failed for $type: ${e.message}")
+                }
+
+                if (!isExtracted) {
+                    nextQueue.add(task)
                 }
             }
-            
-            isExtracted 
+
+            currentQueue = nextQueue
+            if (currentQueue.isNotEmpty() && attempt < maxRetries) {
+                delay(1500L)
+            }
+            attempt++
         }
     }
 
