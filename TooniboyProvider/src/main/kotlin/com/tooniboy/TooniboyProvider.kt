@@ -17,10 +17,6 @@ data class ToonMedia(
     val title: String? = null,
 )
 
-/**
- * Watchable page URL + its type.
- * trtype: 1 = movie, 2 = episode (toronites embed system)
- */
 data class EpisodeData(val url: String, val trtype: Int = 2)
 
 // ─── TMDB Data Classes ───
@@ -70,7 +66,7 @@ open class Tooniboy : MainAPI() {
         TvType.Cartoon,
     )
 
-    // ─── TMDB (Logo + Backdrop only) ────────────────────────────
+    // ─── TMDB ───────────────────────────────────────────────────
     private val TMDB_API = "https://api.themoviedb.org/3"
     private val TMDB_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/original"
@@ -84,8 +80,7 @@ open class Tooniboy : MainAPI() {
         t = t.replace(Regex("\\s+dub(?:bed)?\\s*$", RegexOption.IGNORE_CASE), "")
         t = t.replace(Regex("\\s*fan\\s*dub.*", RegexOption.IGNORE_CASE), "")
         t = t.replace(Regex("\\s*fandub.*", RegexOption.IGNORE_CASE), "")
-        t = t.substringBefore("(").substringBefore("[")
-        t = t.trim()
+        t = t.substringBefore("(").substringBefore("[").trim()
         return t.ifBlank { title }
     }
 
@@ -93,25 +88,21 @@ open class Tooniboy : MainAPI() {
         (s ?: "").replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
 
     private fun getResultYear(result: TmdbResult): Int? {
-        val dateString = result.releaseDate ?: result.firstAirDate ?: return null
-        if (dateString.contains("-")) return dateString.substringBefore("-").toIntOrNull()
-        return null
+        val d = result.releaseDate ?: result.firstAirDate ?: return null
+        return if (d.contains("-")) d.substringBefore("-").toIntOrNull() else null
     }
 
     private fun yearMatches(tmdbYear: Int?, siteYear: Int?): Boolean {
         if (siteYear == null || tmdbYear == null) return true
-        val diff = tmdbYear - siteYear
-        return diff == 0 || diff == 1 || diff == -1
+        return kotlin.math.abs(tmdbYear - siteYear) <= 1
     }
 
     private fun pickBestResult(candidates: List<TmdbResult>, siteYear: Int?): TmdbResult? {
         if (candidates.isEmpty()) return null
         if (siteYear != null) {
-            val yearMatched = candidates.filter { yearMatches(getResultYear(it), siteYear) }
-            if (yearMatched.isNotEmpty()) {
-                if (yearMatched.size == 1) return yearMatched[0]
-                return yearMatched.firstOrNull { it.genreIds?.contains(16) == true } ?: yearMatched[0]
-            }
+            val matched = candidates.filter { yearMatches(getResultYear(it), siteYear) }
+            if (matched.isNotEmpty())
+                return matched.firstOrNull { it.genreIds?.contains(16) == true } ?: matched[0]
         }
         return candidates[0]
     }
@@ -120,92 +111,38 @@ open class Tooniboy : MainAPI() {
         return try {
             val title = cleanForTmdb(rawTitle)
             if (title.isBlank()) return TmdbDetails(null, null, null, null)
-
             var tmdbId: Int? = null
             var mediaType = if (isSeries) "tv" else "movie"
-
             val safeTitle = URLEncoder.encode(title, "UTF-8")
-            val searchRes = app.get("$TMDB_API/search/multi?api_key=$TMDB_KEY&query=$safeTitle")
-                .parsedSafe<TmdbSearch>()
-
-            val validResults = searchRes?.results
-                ?.filter { it.mediaType == "movie" || it.mediaType == "tv" }
-                .orEmpty()
-
+            val validResults = app.get("$TMDB_API/search/multi?api_key=$TMDB_KEY&query=$safeTitle")
+                .parsedSafe<TmdbSearch>()?.results
+                ?.filter { it.mediaType == "movie" || it.mediaType == "tv" }.orEmpty()
             val normTitle = normalizeTitle(title)
-
-            val exactCandidates = validResults.filter {
-                normalizeTitle(it.title) == normTitle || normalizeTitle(it.name) == normTitle
-            }
-            val exactMatch = pickBestResult(exactCandidates, year)
-            if (exactMatch != null) {
-                tmdbId = exactMatch.id
-                exactMatch.mediaType?.let { mediaType = it }
-            }
-
-            if (tmdbId == null && normTitle.length >= 6) {
-                val startsWithCandidates = validResults.filter {
-                    val tn = normalizeTitle(it.title).ifEmpty { normalizeTitle(it.name) }
-                    tn.startsWith(normTitle)
-                }
-                val swMatch = pickBestResult(startsWithCandidates, year)
-                if (swMatch != null) {
-                    tmdbId = swMatch.id
-                    swMatch.mediaType?.let { mediaType = it }
-                }
-            }
-
+            pickBestResult(validResults.filter { normalizeTitle(it.title) == normTitle || normalizeTitle(it.name) == normTitle }, year)
+                ?.also { tmdbId = it.id; it.mediaType?.let { m -> mediaType = m } }
+            if (tmdbId == null && normTitle.length >= 6)
+                pickBestResult(validResults.filter { normalizeTitle(it.title).ifEmpty { normalizeTitle(it.name) }.startsWith(normTitle) }, year)
+                    ?.also { tmdbId = it.id; it.mediaType?.let { m -> mediaType = m } }
             if (tmdbId == null && document != null) {
-                var imdbId: String? = null
-                for (link in document.select("a[href*='imdb.com/title']")) {
-                    val href = link.attr("href")
-                    if (href.contains("title/")) {
-                        val possibleId = href.substringAfter("title/").substringBefore("/")
-                        if (possibleId.startsWith("tt")) { imdbId = possibleId; break }
-                    }
-                }
+                val imdbId = document.select("a[href*='imdb.com/title']")
+                    .mapNotNull { it.attr("href").substringAfter("title/", "").substringBefore("/").takeIf { id -> id.startsWith("tt") } }
+                    .firstOrNull()
                 if (imdbId != null) {
-                    val findRes = app.get("$TMDB_API/find/$imdbId?api_key=$TMDB_KEY&external_source=imdb_id")
-                        .parsedSafe<TmdbFind>()
-                    val tvMatch = findRes?.tvShows?.firstOrNull()
-                    val movieMatch = findRes?.movies?.firstOrNull()
-                    val chosen: TmdbResult? = if (isSeries) tvMatch ?: movieMatch else movieMatch ?: tvMatch
-                    if (chosen != null) {
-                        tmdbId = chosen.id
-                        chosen.mediaType?.let { mediaType = it } ?: run { mediaType = if (isSeries) "tv" else "movie" }
-                    }
+                    val find = app.get("$TMDB_API/find/$imdbId?api_key=$TMDB_KEY&external_source=imdb_id").parsedSafe<TmdbFind>()
+                    val chosen = if (isSeries) find?.tvShows?.firstOrNull() ?: find?.movies?.firstOrNull()
+                                 else find?.movies?.firstOrNull() ?: find?.tvShows?.firstOrNull()
+                    chosen?.also { tmdbId = it.id; mediaType = it.mediaType ?: if (isSeries) "tv" else "movie" }
                 }
             }
-
             if (tmdbId == null) return TmdbDetails(null, null, null, null)
-
-            val images = app.get("$TMDB_API/$mediaType/$tmdbId/images?api_key=$TMDB_KEY")
-                .parsedSafe<TmdbImages>()
-
-            var logoUrl: String? = null
-            var backdropUrl: String? = null
-
-            if (images != null) {
-                images.logos?.let { logos ->
-                    val validLogos = logos.filter { img ->
-                        val p = img.filePath ?: ""
-                        p.isNotEmpty() && !p.endsWith(".svg") && !p.endsWith(".SVG")
-                    }
-                    val bestLogo = validLogos.firstOrNull { it.lang == "en" }
-                        ?: validLogos.firstOrNull { it.lang == null }
-                        ?: validLogos.firstOrNull { it.lang == "ja" }
-                        ?: validLogos.firstOrNull()
-                    bestLogo?.filePath?.let { logoUrl = "$TMDB_IMG$it" }
-                }
-                images.backdrops?.let { backs ->
-                    val bestBackdrop = backs.firstOrNull { it.lang == null }
-                        ?: backs.firstOrNull { it.lang == "en" }
-                        ?: backs.firstOrNull()
-                    bestBackdrop?.filePath?.let { backdropUrl = "$TMDB_IMG$it" }
-                }
-            }
-
-            TmdbDetails(tmdbId, mediaType, logoUrl, backdropUrl)
+            val images = app.get("$TMDB_API/$mediaType/$tmdbId/images?api_key=$TMDB_KEY").parsedSafe<TmdbImages>()
+            val logo = images?.logos?.filter { !(it.filePath ?: "").endsWith(".svg", true) }
+                ?.let { l -> l.firstOrNull { it.lang == "en" } ?: l.firstOrNull { it.lang == null } ?: l.firstOrNull { it.lang == "ja" } ?: l.firstOrNull() }
+                ?.filePath?.let { "$TMDB_IMG$it" }
+            val backdrop = images?.backdrops
+                ?.let { b -> b.firstOrNull { it.lang == null } ?: b.firstOrNull { it.lang == "en" } ?: b.firstOrNull() }
+                ?.filePath?.let { "$TMDB_IMG$it" }
+            TmdbDetails(tmdbId, mediaType, logo, backdrop)
         } catch (e: Exception) {
             Log.e("Tooniboy", "TMDB failed: ${e.message}")
             TmdbDetails(null, null, null, null)
@@ -215,34 +152,28 @@ open class Tooniboy : MainAPI() {
     // ─── Helpers ────────────────────────────────────────────────
 
     private fun Element.getImageSrc(): String? {
-        val img = this.selectFirst("img") ?: return null
+        val img = selectFirst("img") ?: return null
         val src = img.attr("data-src").ifEmpty { img.attr("src") }
-        if (src.isEmpty()) return null
-        return fixUrl(src)
+        return if (src.isEmpty()) null else fixUrl(src)
     }
 
-    private fun cleanTitle(title: String): String = title.replace(Regex("\\s+"), " ").trim()
+    private fun cleanTitle(t: String) = t.replace(Regex("\\s+"), " ").trim()
 
-    private fun detectType(href: String): TvType = when {
-        href.contains("/movies/") -> TvType.Movie
-        href.contains("/movie/") -> TvType.Movie
-        else -> TvType.TvSeries
-    }
+    private fun detectType(href: String) =
+        if (href.contains("/movies/") || href.contains("/movie/")) TvType.Movie else TvType.TvSeries
 
-    private fun isMovieUrl(url: String): Boolean =
-        url.contains("/movies/") || url.contains("/movie/")
+    private fun isMovieUrl(url: String) = url.contains("/movies/") || url.contains("/movie/")
 
     private fun Element.toSearchResult(tvType: TvType): SearchResponse? {
-        val anchor = this.selectFirst("a[href*='/series/'], a[href*='/movies/'], a[href*='/movie/']")
-            ?: return null
+        val anchor = selectFirst("a[href*='/series/'], a[href*='/movies/'], a[href*='/movie/']") ?: return null
         val href = fixUrl(anchor.attr("href"))
         val title = cleanTitle(
-            this.selectFirst("h2.Title, div.Title, h2")?.text()
-                ?: this.selectFirst("img")?.attr("alt")?.replace(Regex("^Image\\s*"), "")
+            selectFirst("h2.Title, div.Title, h2")?.text()
+                ?: selectFirst("img")?.attr("alt")?.replace(Regex("^Image\\s*"), "")
                 ?: return null
         )
         if (title.isBlank()) return null
-        val poster = this.getImageSrc()
+        val poster = getImageSrc()
         return newMovieSearchResponse(title, Gson().toJson(ToonMedia(href, poster, title)), tvType) {
             this.posterUrl = poster
         }
@@ -259,10 +190,20 @@ open class Tooniboy : MainAPI() {
         return home
     }
 
-    private fun parseDuration(text: String?): Int? {
-        if (text.isNullOrBlank()) return null
-        return Regex("(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
-    }
+    private fun parseDuration(text: String?) =
+        if (text.isNullOrBlank()) null else Regex("(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
+
+    // ─── CF warm-up headers ─────────────────────────────────────
+    // Sending these headers with every tooniboy.co request makes
+    // Cloudflare treat the request as a normal browser visit and
+    // issue/refresh the cf_clearance cookie so trembed URLs work
+    // even after the app has been closed and reopened.
+    private val cfHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Accept" to "text/html,application/xhtml+xml,application/xhtml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.5",
+        "Referer" to "https://tooniboy.co/"
+    )
 
     // ─── Main Page ──────────────────────────────────────────────
 
@@ -281,12 +222,9 @@ open class Tooniboy : MainAPI() {
             path == "movies" -> "$mainUrl/movies/"
             else -> "$mainUrl/$path/"
         } + (if (page > 1) "page/$page/" else "")
-
-        val document = app.get(url).document
+        val document = app.get(url, headers = cfHeaders).document
         val home = parseCardList(document)
-        val hasNext = document.selectFirst(
-            "nav.wp-pagenavi a, a.next.page-numbers, link[rel=next], .pagination .next"
-        ) != null
+        val hasNext = document.selectFirst("nav.wp-pagenavi a, a.next.page-numbers, link[rel=next], .pagination .next") != null
         return newHomePageResponse(request.name, home, hasNext)
     }
 
@@ -294,7 +232,7 @@ open class Tooniboy : MainAPI() {
 
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val url = if (page <= 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
-        val document = app.get(url).document
+        val document = app.get(url, headers = cfHeaders).document
         val results = parseCardList(document)
         val hasNext = document.selectFirst("nav.wp-pagenavi a, a.next.page-numbers") != null
         return newSearchResponseList(results, hasNext)
@@ -304,18 +242,14 @@ open class Tooniboy : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val media = try { Gson().fromJson(url, ToonMedia::class.java) } catch (e: Exception) { ToonMedia(url) }
-
         val actualUrl = media.url
         val movie = isMovieUrl(actualUrl)
-        val document = app.get(actualUrl).document
-
-        val rawTitle = media.title
-            ?: cleanTitle(
-                document.selectFirst("h1.Title")?.text()
-                    ?: document.selectFirst("title")?.text()?.replace(" - Tooniboy", "")
-                    ?: "Unknown"
-            )
-
+        val document = app.get(actualUrl, headers = cfHeaders).document
+        val rawTitle = media.title ?: cleanTitle(
+            document.selectFirst("h1.Title")?.text()
+                ?: document.selectFirst("title")?.text()?.replace(" - Tooniboy", "")
+                ?: "Unknown"
+        )
         val background = fixUrlNull(document.selectFirst("figure.Objf img.TPostBg")?.attr("src"))
         val poster = media.poster ?: background
         val description = extractDescription(document)
@@ -323,14 +257,10 @@ open class Tooniboy : MainAPI() {
         val rating = document.selectFirst("div.post-ratings span")?.text()?.trim()?.toDoubleOrNull()
         val duration = document.selectFirst("span.Time")?.text()?.trim()
         val recommendations = parseRecommendations(document)
-
         val seasonLinks = document.select("section.SeasonBx .Title a[href*='/season/']")
-            .map { fixUrl(it.attr("href")) }
-            .filter { it.isNotBlank() }
+            .map { fixUrl(it.attr("href")) }.filter { it.isNotBlank() }
         val isSeries = !movie && seasonLinks.isNotEmpty()
-
         val tmdb = fetchTmdbAssets(document, rawTitle, isSeries, year)
-
         return if (isSeries) {
             loadSeries(media, document, rawTitle, poster, background, description, year, rating, seasonLinks, recommendations, tmdb)
         } else {
@@ -351,21 +281,15 @@ open class Tooniboy : MainAPI() {
         val descDiv = document.selectFirst("div.Description") ?: return null
         var html = descDiv.html()
         html = html.substringBefore("""<p class="Genre">""")
-            .substringBefore("""<p class="Cast">""")
-            .substringBefore("""<p class="Tags">""")
-        val candidates = Jsoup.parse(html).select("p")
-        for (p in candidates) {
+            .substringBefore("""<p class="Cast">""").substringBefore("""<p class="Tags">""")
+        for (p in Jsoup.parse(html).select("p")) {
             if (p.hasClass("Genre") || p.hasClass("Cast") || p.hasClass("Tags")) continue
             val clone = p.clone()
-            clone.select("img").remove()
-            clone.select("script,style").remove()
+            clone.select("img,script,style").remove()
             val text = clone.text().trim()
             if (text.length > 20) return text
         }
-        document.selectFirst("meta[name=description]")?.attr("content")?.let {
-            if (it.isNotBlank()) return it.trim()
-        }
-        return null
+        return document.selectFirst("meta[name=description]")?.attr("content")?.trim()?.ifBlank { null }
     }
 
     private fun parseRecommendations(document: Document): List<SearchResponse> {
@@ -377,45 +301,30 @@ open class Tooniboy : MainAPI() {
                     || it.text().contains("More like this", ignoreCase = true)
                     || it.text().contains("Related", ignoreCase = true)
             }
-            val section: Element? = header?.parents()?.firstOrNull { parent ->
-                parent.select("a[href*='/series/'], a[href*='/movies/']").isNotEmpty()
+            val section = header?.parents()?.firstOrNull { p ->
+                p.select("a[href*='/series/'], a[href*='/movies/']").isNotEmpty()
             }
             val cards = section?.select("div.TPost.B") ?: document.select("div.MovieListTop div.TPost.B")
             for (el in cards) {
-                val anchor = el.selectFirst("a[href*='/series/'], a[href*='/movies/'], a[href*='/movie/']") ?: continue
-                val href = anchor.attr("href")
+                val href = el.selectFirst("a[href*='/series/'], a[href*='/movies/'], a[href*='/movie/']")?.attr("href") ?: continue
                 if (!seen.add(href)) continue
                 el.toSearchResult(detectType(href))?.let { recs.add(it) }
             }
-        } catch (e: Exception) {
-            Log.e("Tooniboy", "recommendations failed: ${e.message}")
-        }
+        } catch (e: Exception) { Log.e("Tooniboy", "recommendations failed: ${e.message}") }
         return recs
     }
 
     private suspend fun loadSeries(
-        media: ToonMedia,
-        document: Document,
-        title: String,
-        poster: String?,
-        background: String?,
-        description: String?,
-        year: Int?,
-        rating: Double?,
-        seasonUrls: List<String>,
-        recommendations: List<SearchResponse>,
-        tmdb: TmdbDetails
+        media: ToonMedia, document: Document, title: String, poster: String?,
+        background: String?, description: String?, year: Int?, rating: Double?,
+        seasonUrls: List<String>, recommendations: List<SearchResponse>, tmdb: TmdbDetails
     ): LoadResponse {
         val episodes = mutableListOf<Episode>()
         val seasonSlugRegex = Regex("/season/(.+)-(\\d+)/?$")
-
         for ((index, seasonUrl) in seasonUrls.withIndex()) {
-            val match = seasonSlugRegex.find(seasonUrl)
-            val seasonNum = match?.groupValues?.get(2)?.toIntOrNull() ?: (index + 1)
-            val seasonDoc = try { app.get(seasonUrl).document } catch (e: Exception) {
-                Log.e("Tooniboy", "Failed to load season $seasonNum: ${e.message}"); null
-            } ?: continue
-
+            val seasonNum = seasonSlugRegex.find(seasonUrl)?.groupValues?.get(2)?.toIntOrNull() ?: (index + 1)
+            val seasonDoc = try { app.get(seasonUrl, headers = cfHeaders).document }
+                catch (e: Exception) { Log.e("Tooniboy", "season $seasonNum failed: ${e.message}"); null } ?: continue
             val rows = seasonDoc.select("div.TPTblCn table tbody tr")
             if (rows.isNotEmpty()) {
                 for (row in rows) {
@@ -423,44 +332,31 @@ open class Tooniboy : MainAPI() {
                     val epLink = row.selectFirst("td.MvTbImg a[href], td.MvTbTtl a[href]")?.attr("href") ?: continue
                     val epThumb = row.selectFirst("td.MvTbImg img")?.let { row.getImageSrc() }
                     val epName = row.selectFirst("td.MvTbTtl a")?.text()?.trim().orEmpty().ifBlank { "Episode $epNum" }
-                    episodes.add(
-                        newEpisode(Gson().toJson(EpisodeData(fixUrl(epLink), trtype = 2))) {
-                            this.name = epName
-                            this.posterUrl = epThumb
-                            this.season = seasonNum
-                            this.episode = epNum
-                        }
-                    )
+                    episodes.add(newEpisode(Gson().toJson(EpisodeData(fixUrl(epLink), trtype = 2))) {
+                        this.name = epName; this.posterUrl = epThumb; this.season = seasonNum; this.episode = epNum
+                    })
                 }
             } else {
                 var fallbackEp = 1
                 for (el in seasonDoc.select("article.TPost, li.TPostMv")) {
                     val href = el.selectFirst("a[href*='/episode/']")?.attr("href") ?: continue
-                    val name = cleanTitle(el.selectFirst("h2.Title")?.text() ?: "Episode $fallbackEp")
-                    episodes.add(
-                        newEpisode(Gson().toJson(EpisodeData(fixUrl(href), trtype = 2))) {
-                            this.name = name
-                            this.season = seasonNum
-                            this.episode = fallbackEp
-                        }
-                    )
+                    episodes.add(newEpisode(Gson().toJson(EpisodeData(fixUrl(href), trtype = 2))) {
+                        this.name = cleanTitle(el.selectFirst("h2.Title")?.text() ?: "Episode $fallbackEp")
+                        this.season = seasonNum; this.episode = fallbackEp
+                    })
                     fallbackEp++
                 }
             }
         }
-
         return newTvSeriesLoadResponse(title, Gson().toJson(media), TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.backgroundPosterUrl = tmdb.backdrop ?: background ?: poster
-            this.plot = description
-            this.year = year
-            this.score = Score.from10(rating)
-            this.recommendations = recommendations
-            this.logoUrl = tmdb.logo
+            this.plot = description; this.year = year; this.score = Score.from10(rating)
+            this.recommendations = recommendations; this.logoUrl = tmdb.logo
         }
     }
 
-    // ─── Load Links (Servers) ───────────────────────────────────
+    // ─── Load Links ──────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -471,55 +367,50 @@ open class Tooniboy : MainAPI() {
         val epData = try {
             Gson().fromJson(data, EpisodeData::class.java)
         } catch (e: Exception) {
-            Log.e("Tooniboy", "Failed to parse episode data: ${e.message}")
-            return false
+            Log.e("Tooniboy", "parse failed: ${e.message}"); return false
         }
 
-        // Always fetch a fresh page — no stale cache allowed
-        val document = try {
-            app.get(epData.url, headers = mapOf("Cache-Control" to "no-cache")).document
+        // Step 1: Hit the homepage first so Cloudflare sets/refreshes cf_clearance cookie.
+        // Without this, trembed requests after app restart get blocked by Cloudflare and
+        // return an empty/challenge page instead of the iframe — causing missing video URLs.
+        try {
+            app.get(mainUrl, headers = cfHeaders)
+            Log.d("Tooniboy", "CF warm-up done")
         } catch (e: Exception) {
-            Log.e("Tooniboy", "Failed to load episode page: ${e.message}")
-            return false
+            Log.w("Tooniboy", "CF warm-up failed (continuing anyway): ${e.message}")
+        }
+
+        // Step 2: Fetch the episode page with CF headers so the cookie carries over.
+        val document = try {
+            app.get(epData.url, headers = cfHeaders).document
+        } catch (e: Exception) {
+            Log.e("Tooniboy", "episode page failed: ${e.message}"); return false
         }
 
         val serverButtons = document.select("button[data-key][data-id]")
-        val firstButton: Element? = serverButtons.firstOrNull()
+        val firstButton = serverButtons.firstOrNull()
 
         val trtype = when {
-            firstButton != null && firstButton.attr("data-typ") == "movie" -> 1
+            firstButton?.attr("data-typ") == "movie" -> 1
             isMovieUrl(epData.url) -> 1
             else -> if (epData.trtype == 1 || epData.trtype == 2) epData.trtype else 2
         }
 
         var success = false
 
-        // ── Default player (VidStreamX -> as-cdn embed) ──
-        val defaultIframe = document.selectFirst("div.Video.on > iframe[src]")
-        defaultIframe?.attr("src")?.takeIf { it.isNotBlank() }?.let { src ->
+        // Default player (Zephyrflick / as-cdn)
+        document.selectFirst("div.Video.on > iframe[src]")?.attr("src")?.takeIf { it.isNotBlank() }?.let { src ->
             try {
                 val resolved = resolveDefaultPlayer(src)
-                if (!resolved.isNullOrEmpty()) {
-                    loadExtractor(resolved, subtitleCallback, callback)
-                    success = true
-                } else {
-                    loadExtractor(src, epData.url, subtitleCallback, callback)
-                    success = true
-                }
-            } catch (e: Exception) {
-                Log.e("Tooniboy", "Default player failed: ${e.message}")
-            }
+                loadExtractor(resolved ?: src, epData.url, subtitleCallback, callback)
+                success = true
+            } catch (e: Exception) { Log.e("Tooniboy", "default player failed: ${e.message}") }
         }
 
-        // ── trembed servers ──
-        // FIX 1: read data-id from each button individually instead of reusing firstButton's id for all.
-        // FIX 2: 300ms stagger between requests to avoid site rate-limiting subsequent calls.
-        // FIX 3: Cache-Control no-cache so the site always returns a fresh embed page.
+        // trembed servers — per-button trid + CF headers + 300ms stagger
         for ((index, btn) in serverButtons.withIndex()) {
             val key = btn.attr("data-key").toIntOrNull() ?: continue
-            val trid = btn.attr("data-id").ifBlank {
-                firstButton?.attr("data-id")
-            } ?: continue
+            val trid = btn.attr("data-id").ifBlank { firstButton?.attr("data-id") } ?: continue
             val label = btn.text().trim().ifBlank { "Server ${key + 1}" }
 
             if (index > 0) delay(300L)
@@ -527,19 +418,19 @@ open class Tooniboy : MainAPI() {
             try {
                 val embedDoc = app.get(
                     "$mainUrl/?trembed=$key&trid=$trid&trtype=$trtype",
-                    headers = mapOf("Cache-Control" to "no-cache")
+                    headers = cfHeaders
                 ).document
-                val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")
-                    ?.replace("&amp;", "&")
+
+                val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")?.replace("&amp;", "&")
                 if (!iframeSrc.isNullOrBlank()) {
                     loadExtractor(iframeSrc, epData.url, subtitleCallback, callback)
                     success = true
-                    Log.d("Tooniboy", "[$label] key=$key trid=$trid -> $iframeSrc")
+                    Log.d("Tooniboy", "[$label] $iframeSrc")
                 } else {
-                    Log.w("Tooniboy", "[$label] key=$key trid=$trid -> no iframe found")
+                    Log.w("Tooniboy", "[$label] key=$key trid=$trid -> no iframe")
                 }
             } catch (e: Exception) {
-                Log.e("Tooniboy", "Server key=$key ($label) failed: ${e.message}")
+                Log.e("Tooniboy", "[$label] failed: ${e.message}")
             }
         }
 
@@ -548,15 +439,11 @@ open class Tooniboy : MainAPI() {
 
     private suspend fun resolveDefaultPlayer(src: String): String? {
         return try {
-            if (src.contains("as-cdn")) {
-                src
-            } else {
-                val innerDoc = app.get(src).document
-                innerDoc.selectFirst("iframe[src]")?.attr("src")
+            if (src.contains("as-cdn")) src
+            else {
+                app.get(src).document.selectFirst("iframe[src]")?.attr("src")
                     ?.takeIf { it.contains("as-cdn") || it.contains("zephyrflick") || it.contains("awstream") }
             }
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 }
