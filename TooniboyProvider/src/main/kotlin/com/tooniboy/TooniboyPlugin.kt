@@ -12,7 +12,6 @@ class TooniboyPlugin : BasePlugin() {
         registerExtractorAPI(StreamRuby())
         registerExtractorAPI(Cloudy())
         registerExtractorAPI(GDMirrorbot())
-        registerExtractorAPI(GDMirrorbotFHD())
         registerExtractorAPI(EmTurboVid())
         registerExtractorAPI(VidMolyNet())
         registerExtractorAPI(Blakite())
