@@ -68,6 +68,17 @@ open class Tooniboy : MainAPI() {
     private val L = TooniboyLogger
     private val TAG = "Tooniboy"
 
+    // Extractor instances — reused every call so CloudStream built-ins are never picked
+    private val extAbyss      = Abyss()
+    private val extStreamRuby = StreamRuby()
+    private val extCloudy     = Cloudy()
+    private val extGDMirror   = GDMirrorbot()
+    private val extFGDMirror  = FGDMirrorbot()
+    private val extTurbo      = EmTurboVid()
+    private val extVidMoly    = VidMolyNet()
+    private val extBlakite    = Blakite()
+    private val extZephyr     = Zephyrflick()
+
     private val TMDB_API = "https://api.themoviedb.org/3"
     private val TMDB_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/original"
@@ -157,10 +168,8 @@ open class Tooniboy : MainAPI() {
     }
 
     private fun cleanTitle(t: String) = t.replace(Regex("\\s+"), " ").trim()
-
     private fun detectType(href: String) =
         if (href.contains("/movies/") || href.contains("/movie/")) TvType.Movie else TvType.TvSeries
-
     private fun isMovieUrl(url: String) = url.contains("/movies/") || url.contains("/movie/")
 
     private fun Element.toSearchResult(tvType: TvType): SearchResponse? {
@@ -336,7 +345,10 @@ open class Tooniboy : MainAPI() {
         }
     }
 
-    // ─── Load Links ──────────────────────────────────────────────
+    // ─── Load Links ───────────────────────────────────────────────────────────
+    // KEY FIX: instead of loadExtractor() which lets CloudStream pick any built-in
+    // extractor by domain match, we call our own extractor instances directly.
+    // This guarantees our custom extraction logic runs every single time.
 
     override suspend fun loadLinks(
         data: String,
@@ -349,39 +361,28 @@ open class Tooniboy : MainAPI() {
         val epData = try {
             Gson().fromJson(data, EpisodeData::class.java)
         } catch (e: Exception) {
-            L.e(TAG, "EpisodeData parse failed: ${e.message}")
-            return false
+            L.e(TAG, "EpisodeData parse failed: ${e.message}"); return false
         }
 
         L.i(TAG, "URL: ${epData.url}")
-        L.i(TAG, "trtype stored: ${epData.trtype}")
 
-        // ── Step 1: CF warm-up ───────────────────────────────────
-        L.d(TAG, "CF warm-up -> GET $mainUrl")
         try {
             val warmupResp = app.get(mainUrl, headers = cfHeaders)
-            L.i(TAG, "CF warm-up HTTP ${warmupResp.code} title='${warmupResp.document.title()}'")
+            L.i(TAG, "CF warm-up HTTP ${warmupResp.code}")
         } catch (e: Exception) {
-            L.w(TAG, "CF warm-up FAILED: ${e.message} (continuing anyway)")
+            L.w(TAG, "CF warm-up FAILED: ${e.message}")
         }
 
-        // ── Step 2: Episode page ─────────────────────────────────
-        L.d(TAG, "Fetching episode page: ${epData.url}")
         val document = try {
             val resp = app.get(epData.url, headers = cfHeaders)
             L.i(TAG, "Episode page HTTP ${resp.code} title='${resp.document.title()}'")
             resp.document
         } catch (e: Exception) {
-            L.e(TAG, "Episode page FAILED: ${e.message}")
-            return false
+            L.e(TAG, "Episode page FAILED: ${e.message}"); return false
         }
 
-        // ── Step 3: Parse server buttons ─────────────────────────
         val serverButtons = document.select("button[data-key][data-id]")
         L.i(TAG, "Server buttons found: ${serverButtons.size}")
-        serverButtons.forEachIndexed { i, btn ->
-            L.d(TAG, "  btn[$i] key=${btn.attr("data-key")} id=${btn.attr("data-id")} typ=${btn.attr("data-typ")} label='${btn.text().trim()}'")
-        }
 
         val firstButton = serverButtons.firstOrNull()
         val trtype = when {
@@ -389,71 +390,119 @@ open class Tooniboy : MainAPI() {
             isMovieUrl(epData.url) -> 1
             else -> if (epData.trtype == 1 || epData.trtype == 2) epData.trtype else 2
         }
-        L.i(TAG, "trtype resolved: $trtype")
 
         var success = false
 
-        // ── Default player ───────────────────────────────────────
-        val defaultIframeSrc = document.selectFirst("div.Video.on > iframe[src]")?.attr("src")
-        if (!defaultIframeSrc.isNullOrBlank()) {
-            L.d(TAG, "Default iframe src: $defaultIframeSrc")
+        // Default player — Zephyrflick / animedekho
+        document.selectFirst("div.Video.on > iframe[src]")?.attr("src")?.takeIf { it.isNotBlank() }?.let { src ->
             try {
-                val resolved = resolveDefaultPlayer(defaultIframeSrc)
-                L.i(TAG, "Default player resolved: ${resolved ?: "(null, using original)"}")
-                loadExtractor(resolved ?: defaultIframeSrc, epData.url, subtitleCallback, callback)
+                L.d(TAG, "Default iframe: $src")
+                val resolved = resolveDefaultPlayer(src)
+                val finalSrc = resolved ?: src
+                L.i(TAG, "Default player -> $finalSrc")
+                extZephyr.getUrl(finalSrc, epData.url, subtitleCallback, callback)
                 success = true
-            } catch (e: Exception) {
-                L.e(TAG, "Default player failed: ${e.message}")
-            }
-        } else {
-            L.w(TAG, "No default iframe found (div.Video.on > iframe[src] missing)")
+            } catch (e: Exception) { L.e(TAG, "Default player failed: ${e.message}") }
         }
 
-        // ── trembed servers ──────────────────────────────────────
         if (serverButtons.isEmpty()) {
-            L.e(TAG, "NO SERVER BUTTONS — page may be a Cloudflare challenge or login wall")
-            L.w(TAG, "Page snippet: ${document.body().text().take(300)}")
+            L.e(TAG, "NO SERVER BUTTONS — possible CF block")
+            L.w(TAG, "Body snippet: ${document.body().text().take(300)}")
         }
 
         for ((index, btn) in serverButtons.withIndex()) {
-            val key = btn.attr("data-key").toIntOrNull() ?: run {
-                L.w(TAG, "btn[$index] data-key not a number, skipping"); continue
-            }
-            val trid = btn.attr("data-id").ifBlank { firstButton?.attr("data-id") } ?: run {
-                L.w(TAG, "btn[$index] data-id empty and no fallback, skipping"); continue
-            }
+            val key = btn.attr("data-key").toIntOrNull() ?: continue
+            val trid = btn.attr("data-id").ifBlank { firstButton?.attr("data-id") } ?: continue
             val label = btn.text().trim().ifBlank { "Server ${key + 1}" }
 
             if (index > 0) delay(300L)
 
             val embedUrl = "$mainUrl/?trembed=$key&trid=$trid&trtype=$trtype"
-            L.d(TAG, "[$label] embed URL: $embedUrl")
-
             try {
                 val embedResp = app.get(embedUrl, headers = cfHeaders)
                 val embedDoc = embedResp.document
-                L.i(TAG, "[$label] embed HTTP ${embedResp.code} title='${embedDoc.title()}'")
+                L.i(TAG, "[$label] HTTP ${embedResp.code}")
 
                 val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")?.replace("&amp;", "&")
-                if (!iframeSrc.isNullOrBlank()) {
-                    L.i(TAG, "[$label] iframe OK: $iframeSrc")
-                    loadExtractor(iframeSrc, epData.url, subtitleCallback, callback)
-                    success = true
-                } else {
-                    // Log the full embed page body snippet so we can diagnose CF/blank pages
-                    val bodyText = embedDoc.body().text().take(400).ifBlank { "(empty body)" }
-                    val iframesFound = embedDoc.select("iframe").size
-                    L.e(TAG, "[$label] NO IFRAME in embed page!")
-                    L.w(TAG, "[$label] iframes on page: $iframesFound | body: $bodyText")
+                if (iframeSrc.isNullOrBlank()) {
+                    L.e(TAG, "[$label] NO IFRAME | body: ${embedDoc.body().text().take(300)}")
+                    continue
                 }
+
+                L.i(TAG, "[$label] iframe: $iframeSrc")
+
+                // Route directly to our own extractor — never goes through CloudStream built-ins
+                val handled = routeToExtractor(iframeSrc, epData.url, label, subtitleCallback, callback)
+                if (handled) success = true
+
             } catch (e: Exception) {
-                L.e(TAG, "[$label] embed request FAILED: ${e.message}")
+                L.e(TAG, "[$label] FAILED: ${e.message}")
             }
         }
 
         L.i(TAG, "loadLinks END — success=$success")
         L.section("loadLinks END")
         return success
+    }
+
+    /**
+     * Routes an iframe URL directly to the matching custom extractor.
+     * Returns true if a matching extractor was found and called.
+     */
+    private suspend fun routeToExtractor(
+        url: String,
+        referer: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            when {
+                url.contains("abyssplayer.com") -> {
+                    L.d(TAG, "[$label] -> Abyss extractor")
+                    extAbyss.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("rubystm.com") -> {
+                    L.d(TAG, "[$label] -> StreamRuby extractor")
+                    extStreamRuby.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("cloudy.upns.one") || url.contains("upns.one") -> {
+                    L.d(TAG, "[$label] -> Cloudy extractor")
+                    extCloudy.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("fgdmirrorbot.nl") -> {
+                    L.d(TAG, "[$label] -> FGDMirrorbot extractor")
+                    extFGDMirror.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("gdmirrorbot.nl") -> {
+                    L.d(TAG, "[$label] -> GDMirrorbot extractor")
+                    extGDMirror.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("emturbovid.com") -> {
+                    L.d(TAG, "[$label] -> EmTurboVid extractor")
+                    extTurbo.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("vidmoly.net") || url.contains("vidmoly.to") -> {
+                    L.d(TAG, "[$label] -> VidMolyNet extractor")
+                    extVidMoly.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("blakiteapi.xyz") -> {
+                    L.d(TAG, "[$label] -> Blakite extractor")
+                    extBlakite.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                url.contains("as-cdn") || url.contains("awstream") || url.contains("zephyrflick") -> {
+                    L.d(TAG, "[$label] -> Zephyrflick extractor")
+                    extZephyr.getUrl(url, referer, subtitleCallback, callback); true
+                }
+                else -> {
+                    // Unknown domain — fall back to CloudStream's loadExtractor as last resort
+                    L.w(TAG, "[$label] unknown domain, fallback loadExtractor: $url")
+                    loadExtractor(url, referer, subtitleCallback, callback); true
+                }
+            }
+        } catch (e: Exception) {
+            L.e(TAG, "[$label] extractor threw: ${e.message}"); false
+        }
     }
 
     private suspend fun resolveDefaultPlayer(src: String): String? {
