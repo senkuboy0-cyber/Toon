@@ -19,7 +19,6 @@ data class ToonMedia(
 
 data class EpisodeData(val url: String, val trtype: Int = 2)
 
-// ─── TMDB Data Classes ───
 data class TmdbImages(
     @JsonProperty("logos") val logos: ArrayList<TmdbImage>? = null,
     @JsonProperty("backdrops") val backdrops: ArrayList<TmdbImage>? = null
@@ -66,7 +65,9 @@ open class Tooniboy : MainAPI() {
         TvType.Cartoon,
     )
 
-    // ─── TMDB ───────────────────────────────────────────────────
+    private val L = TooniboyLogger
+    private val TAG = "Tooniboy"
+
     private val TMDB_API = "https://api.themoviedb.org/3"
     private val TMDB_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/original"
@@ -144,12 +145,10 @@ open class Tooniboy : MainAPI() {
                 ?.filePath?.let { "$TMDB_IMG$it" }
             TmdbDetails(tmdbId, mediaType, logo, backdrop)
         } catch (e: Exception) {
-            Log.e("Tooniboy", "TMDB failed: ${e.message}")
+            Log.e(TAG, "TMDB failed: ${e.message}")
             TmdbDetails(null, null, null, null)
         }
     }
-
-    // ─── Helpers ────────────────────────────────────────────────
 
     private fun Element.getImageSrc(): String? {
         val img = selectFirst("img") ?: return null
@@ -193,19 +192,12 @@ open class Tooniboy : MainAPI() {
     private fun parseDuration(text: String?) =
         if (text.isNullOrBlank()) null else Regex("(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
 
-    // ─── CF warm-up headers ─────────────────────────────────────
-    // Sending these headers with every tooniboy.co request makes
-    // Cloudflare treat the request as a normal browser visit and
-    // issue/refresh the cf_clearance cookie so trembed URLs work
-    // even after the app has been closed and reopened.
     private val cfHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xhtml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.5",
         "Referer" to "https://tooniboy.co/"
     )
-
-    // ─── Main Page ──────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
         "series" to "Series",
@@ -228,8 +220,6 @@ open class Tooniboy : MainAPI() {
         return newHomePageResponse(request.name, home, hasNext)
     }
 
-    // ─── Search ─────────────────────────────────────────────────
-
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val url = if (page <= 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
         val document = app.get(url, headers = cfHeaders).document
@@ -237,8 +227,6 @@ open class Tooniboy : MainAPI() {
         val hasNext = document.selectFirst("nav.wp-pagenavi a, a.next.page-numbers") != null
         return newSearchResponseList(results, hasNext)
     }
-
-    // ─── Load (Detail) ──────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse {
         val media = try { Gson().fromJson(url, ToonMedia::class.java) } catch (e: Exception) { ToonMedia(url) }
@@ -267,11 +255,8 @@ open class Tooniboy : MainAPI() {
             newMovieLoadResponse(rawTitle, url, TvType.Movie, Gson().toJson(EpisodeData(actualUrl, trtype = 1))) {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = tmdb.backdrop ?: background ?: poster
-                this.plot = description
-                this.year = year
-                this.score = Score.from10(rating)
-                this.duration = parseDuration(duration)
-                this.recommendations = recommendations
+                this.plot = description; this.year = year; this.score = Score.from10(rating)
+                this.duration = parseDuration(duration); this.recommendations = recommendations
                 this.logoUrl = tmdb.logo
             }
         }
@@ -284,8 +269,7 @@ open class Tooniboy : MainAPI() {
             .substringBefore("""<p class="Cast">""").substringBefore("""<p class="Tags">""")
         for (p in Jsoup.parse(html).select("p")) {
             if (p.hasClass("Genre") || p.hasClass("Cast") || p.hasClass("Tags")) continue
-            val clone = p.clone()
-            clone.select("img,script,style").remove()
+            val clone = p.clone(); clone.select("img,script,style").remove()
             val text = clone.text().trim()
             if (text.length > 20) return text
         }
@@ -293,24 +277,21 @@ open class Tooniboy : MainAPI() {
     }
 
     private fun parseRecommendations(document: Document): List<SearchResponse> {
-        val recs = mutableListOf<SearchResponse>()
-        val seen = mutableSetOf<String>()
+        val recs = mutableListOf<SearchResponse>(); val seen = mutableSetOf<String>()
         try {
             val header = document.select("div.Top .Title").firstOrNull {
                 it.text().contains("More titles like this", ignoreCase = true)
                     || it.text().contains("More like this", ignoreCase = true)
                     || it.text().contains("Related", ignoreCase = true)
             }
-            val section = header?.parents()?.firstOrNull { p ->
-                p.select("a[href*='/series/'], a[href*='/movies/']").isNotEmpty()
-            }
+            val section = header?.parents()?.firstOrNull { p -> p.select("a[href*='/series/'], a[href*='/movies/']").isNotEmpty() }
             val cards = section?.select("div.TPost.B") ?: document.select("div.MovieListTop div.TPost.B")
             for (el in cards) {
                 val href = el.selectFirst("a[href*='/series/'], a[href*='/movies/'], a[href*='/movie/']")?.attr("href") ?: continue
                 if (!seen.add(href)) continue
                 el.toSearchResult(detectType(href))?.let { recs.add(it) }
             }
-        } catch (e: Exception) { Log.e("Tooniboy", "recommendations failed: ${e.message}") }
+        } catch (e: Exception) { Log.e(TAG, "recommendations failed: ${e.message}") }
         return recs
     }
 
@@ -324,7 +305,7 @@ open class Tooniboy : MainAPI() {
         for ((index, seasonUrl) in seasonUrls.withIndex()) {
             val seasonNum = seasonSlugRegex.find(seasonUrl)?.groupValues?.get(2)?.toIntOrNull() ?: (index + 1)
             val seasonDoc = try { app.get(seasonUrl, headers = cfHeaders).document }
-                catch (e: Exception) { Log.e("Tooniboy", "season $seasonNum failed: ${e.message}"); null } ?: continue
+                catch (e: Exception) { Log.e(TAG, "season $seasonNum failed: ${e.message}"); null } ?: continue
             val rows = seasonDoc.select("div.TPTblCn table tbody tr")
             if (rows.isNotEmpty()) {
                 for (row in rows) {
@@ -349,8 +330,7 @@ open class Tooniboy : MainAPI() {
             }
         }
         return newTvSeriesLoadResponse(title, Gson().toJson(media), TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = tmdb.backdrop ?: background ?: poster
+            this.posterUrl = poster; this.backgroundPosterUrl = tmdb.backdrop ?: background ?: poster
             this.plot = description; this.year = year; this.score = Score.from10(rating)
             this.recommendations = recommendations; this.logoUrl = tmdb.logo
         }
@@ -364,76 +344,115 @@ open class Tooniboy : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        L.section("loadLinks START")
+
         val epData = try {
             Gson().fromJson(data, EpisodeData::class.java)
         } catch (e: Exception) {
-            Log.e("Tooniboy", "parse failed: ${e.message}"); return false
+            L.e(TAG, "EpisodeData parse failed: ${e.message}")
+            return false
         }
 
-        // Step 1: Hit the homepage first so Cloudflare sets/refreshes cf_clearance cookie.
-        // Without this, trembed requests after app restart get blocked by Cloudflare and
-        // return an empty/challenge page instead of the iframe — causing missing video URLs.
+        L.i(TAG, "URL: ${epData.url}")
+        L.i(TAG, "trtype stored: ${epData.trtype}")
+
+        // ── Step 1: CF warm-up ───────────────────────────────────
+        L.d(TAG, "CF warm-up -> GET $mainUrl")
         try {
-            app.get(mainUrl, headers = cfHeaders)
-            Log.d("Tooniboy", "CF warm-up done")
+            val warmupResp = app.get(mainUrl, headers = cfHeaders)
+            L.i(TAG, "CF warm-up HTTP ${warmupResp.code} title='${warmupResp.document.title()}'")
         } catch (e: Exception) {
-            Log.w("Tooniboy", "CF warm-up failed (continuing anyway): ${e.message}")
+            L.w(TAG, "CF warm-up FAILED: ${e.message} (continuing anyway)")
         }
 
-        // Step 2: Fetch the episode page with CF headers so the cookie carries over.
+        // ── Step 2: Episode page ─────────────────────────────────
+        L.d(TAG, "Fetching episode page: ${epData.url}")
         val document = try {
-            app.get(epData.url, headers = cfHeaders).document
+            val resp = app.get(epData.url, headers = cfHeaders)
+            L.i(TAG, "Episode page HTTP ${resp.code} title='${resp.document.title()}'")
+            resp.document
         } catch (e: Exception) {
-            Log.e("Tooniboy", "episode page failed: ${e.message}"); return false
+            L.e(TAG, "Episode page FAILED: ${e.message}")
+            return false
         }
 
+        // ── Step 3: Parse server buttons ─────────────────────────
         val serverButtons = document.select("button[data-key][data-id]")
-        val firstButton = serverButtons.firstOrNull()
+        L.i(TAG, "Server buttons found: ${serverButtons.size}")
+        serverButtons.forEachIndexed { i, btn ->
+            L.d(TAG, "  btn[$i] key=${btn.attr("data-key")} id=${btn.attr("data-id")} typ=${btn.attr("data-typ")} label='${btn.text().trim()}'")
+        }
 
+        val firstButton = serverButtons.firstOrNull()
         val trtype = when {
             firstButton?.attr("data-typ") == "movie" -> 1
             isMovieUrl(epData.url) -> 1
             else -> if (epData.trtype == 1 || epData.trtype == 2) epData.trtype else 2
         }
+        L.i(TAG, "trtype resolved: $trtype")
 
         var success = false
 
-        // Default player (Zephyrflick / as-cdn)
-        document.selectFirst("div.Video.on > iframe[src]")?.attr("src")?.takeIf { it.isNotBlank() }?.let { src ->
+        // ── Default player ───────────────────────────────────────
+        val defaultIframeSrc = document.selectFirst("div.Video.on > iframe[src]")?.attr("src")
+        if (!defaultIframeSrc.isNullOrBlank()) {
+            L.d(TAG, "Default iframe src: $defaultIframeSrc")
             try {
-                val resolved = resolveDefaultPlayer(src)
-                loadExtractor(resolved ?: src, epData.url, subtitleCallback, callback)
+                val resolved = resolveDefaultPlayer(defaultIframeSrc)
+                L.i(TAG, "Default player resolved: ${resolved ?: "(null, using original)"}")
+                loadExtractor(resolved ?: defaultIframeSrc, epData.url, subtitleCallback, callback)
                 success = true
-            } catch (e: Exception) { Log.e("Tooniboy", "default player failed: ${e.message}") }
+            } catch (e: Exception) {
+                L.e(TAG, "Default player failed: ${e.message}")
+            }
+        } else {
+            L.w(TAG, "No default iframe found (div.Video.on > iframe[src] missing)")
         }
 
-        // trembed servers — per-button trid + CF headers + 300ms stagger
+        // ── trembed servers ──────────────────────────────────────
+        if (serverButtons.isEmpty()) {
+            L.e(TAG, "NO SERVER BUTTONS — page may be a Cloudflare challenge or login wall")
+            L.w(TAG, "Page snippet: ${document.body().text().take(300)}")
+        }
+
         for ((index, btn) in serverButtons.withIndex()) {
-            val key = btn.attr("data-key").toIntOrNull() ?: continue
-            val trid = btn.attr("data-id").ifBlank { firstButton?.attr("data-id") } ?: continue
+            val key = btn.attr("data-key").toIntOrNull() ?: run {
+                L.w(TAG, "btn[$index] data-key not a number, skipping"); continue
+            }
+            val trid = btn.attr("data-id").ifBlank { firstButton?.attr("data-id") } ?: run {
+                L.w(TAG, "btn[$index] data-id empty and no fallback, skipping"); continue
+            }
             val label = btn.text().trim().ifBlank { "Server ${key + 1}" }
 
             if (index > 0) delay(300L)
 
+            val embedUrl = "$mainUrl/?trembed=$key&trid=$trid&trtype=$trtype"
+            L.d(TAG, "[$label] embed URL: $embedUrl")
+
             try {
-                val embedDoc = app.get(
-                    "$mainUrl/?trembed=$key&trid=$trid&trtype=$trtype",
-                    headers = cfHeaders
-                ).document
+                val embedResp = app.get(embedUrl, headers = cfHeaders)
+                val embedDoc = embedResp.document
+                L.i(TAG, "[$label] embed HTTP ${embedResp.code} title='${embedDoc.title()}'")
 
                 val iframeSrc = embedDoc.selectFirst("iframe[src]")?.attr("src")?.replace("&amp;", "&")
                 if (!iframeSrc.isNullOrBlank()) {
+                    L.i(TAG, "[$label] iframe OK: $iframeSrc")
                     loadExtractor(iframeSrc, epData.url, subtitleCallback, callback)
                     success = true
-                    Log.d("Tooniboy", "[$label] $iframeSrc")
                 } else {
-                    Log.w("Tooniboy", "[$label] key=$key trid=$trid -> no iframe")
+                    // Log the full embed page body snippet so we can diagnose CF/blank pages
+                    val bodyText = embedDoc.body().text().take(400).ifBlank { "(empty body)" }
+                    val iframesFound = embedDoc.select("iframe").size
+                    L.e(TAG, "[$label] NO IFRAME in embed page!")
+                    L.w(TAG, "[$label] iframes on page: $iframesFound | body: $bodyText")
                 }
             } catch (e: Exception) {
-                Log.e("Tooniboy", "[$label] failed: ${e.message}")
+                L.e(TAG, "[$label] embed request FAILED: ${e.message}")
             }
         }
 
+        L.i(TAG, "loadLinks END — success=$success")
+        L.section("loadLinks END")
         return success
     }
 
