@@ -81,7 +81,7 @@ open class AWSStream : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 0: SHORT -> abyssplayer.com  (enc-dec.app decrypt)
+// Key 0: SHORT -> abyssplayer.com
 // ─────────────────────────────────────────────────────────────
 class Abyss : ExtractorApi() {
     override var name = "Abyss"
@@ -99,27 +99,18 @@ class Abyss : ExtractorApi() {
             "Origin" to "https://playhydrax.com",
             "Referer" to "https://playhydrax.com/"
         )
-
         val document = app.get(url, headers = headers).document
         val scripts = document.select("script").joinToString("\n") { it.data() }
-
         val encrypted = Regex("const\\s+datas\\s*=\\s*\"([^\"]*)\"")
             .find(scripts)?.groupValues?.getOrNull(1) ?: return
-
         val decrypted = app.post(
             url = "https://enc-dec.app/api/dec-abyss",
             headers = headers,
             requestBody = """{"text": "$encrypted"}""".toRequestBody("application/json".toMediaType())
         ).parsedSafe<AbyssResponse>()?.result ?: return
-
         decrypted.sources.filter { it.status }.forEach { source ->
             callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = "$name [${source.codec.uppercase()}]",
-                    url = source.url,
-                    type = INFER_TYPE
-                ) {
+                newExtractorLink(source = name, name = "$name [${source.codec.uppercase()}]", url = source.url, type = INFER_TYPE) {
                     this.quality = getQualityFromName(source.type)
                     this.headers = mapOf("Referer" to "https://playhydrax.com/")
                 }
@@ -129,17 +120,11 @@ class Abyss : ExtractorApi() {
 
     data class AbyssResponse(val status: Long, val result: Result)
     data class Result(val sources: List<AbyssSource>)
-    data class AbyssSource(
-        val url: String,
-        val size: Long,
-        val type: String,
-        val codec: String,
-        val status: Boolean,
-    )
+    data class AbyssSource(val url: String, val size: Long, val type: String, val codec: String, val status: Boolean)
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 1: RUBY -> rubystm.com  (/dl POST + JS unpack)
+// Key 1: RUBY -> rubystm.com
 // ─────────────────────────────────────────────────────────────
 class StreamRuby : ExtractorApi() {
     override var name = "StreamRuby"
@@ -154,38 +139,20 @@ class StreamRuby : ExtractorApi() {
     ) {
         val fileCode = url.substringAfterLast("/e/").substringBefore(".html")
         if (fileCode.isBlank()) return
-
         app.get("$mainUrl/e/$fileCode.html", referer = referer ?: mainUrl)
-
         val html = app.post(
             url = "$mainUrl/dl",
-            data = mapOf(
-                "op" to "embed",
-                "file_code" to fileCode,
-                "auto" to "1",
-                "referer" to (referer ?: "")
-            ),
+            data = mapOf("op" to "embed", "file_code" to fileCode, "auto" to "1", "referer" to (referer ?: "")),
             referer = "$mainUrl/e/$fileCode.html"
         ).text
-
-        val packed = Regex("""eval\(function\(p,a,c,k,e,d\)[\s\S]+?'\|'\)\)""")
-            .find(html)?.value ?: return
+        val packed = Regex("""eval\(function\(p,a,c,k,e,d\)[\s\S]+?'\|'\)\)""").find(html)?.value ?: return
         val unpacked = JsUnpacker(packed).unpack() ?: return
-
-        val m3u8 = Regex("""file\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""")
-            .find(unpacked)?.groupValues?.get(1) ?: return
-
+        val m3u8 = Regex("""file\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1) ?: return
         Regex("""file\s*:\s*"(https?://[^"]+_([a-z]{2,3})\.vtt[^"]*)""[\s\S]+?kind\s*:\s*"captions"""")
-            .findAll(unpacked).forEach { match ->
-                subtitleCallback(SubtitleFile(match.groupValues[2], match.groupValues[1]))
-            }
-
-        callback(
-            newExtractorLink(source = name, name = name, url = m3u8, type = ExtractorLinkType.M3U8) {
-                this.referer = mainUrl
-                this.quality = Qualities.Unknown.value
-            }
-        )
+            .findAll(unpacked).forEach { subtitleCallback(SubtitleFile(it.groupValues[2], it.groupValues[1])) }
+        callback(newExtractorLink(source = name, name = name, url = m3u8, type = ExtractorLinkType.M3U8) {
+            this.referer = mainUrl; this.quality = Qualities.Unknown.value
+        })
     }
 }
 
@@ -217,92 +184,46 @@ open class UpnsPlayer : ExtractorApi() {
         val hash = url.substringAfterLast("#").substringBefore("&").substringBefore("?")
             .ifBlank { url.trimEnd('/').substringAfterLast('/') }
         if (hash.isBlank()) return
-
-        val refHost = try {
-            URI(referer ?: mainUrl).host ?: mainUrl.removePrefix("https://")
-        } catch (e: Exception) {
-            mainUrl.removePrefix("https://")
-        }
-
+        val refHost = try { URI(referer ?: mainUrl).host ?: mainUrl.removePrefix("https://") } catch (e: Exception) { mainUrl.removePrefix("https://") }
         val encoded = try {
-            app.get(
-                "$baseurl/api/v1/video?id=$hash&w=1280&h=720&r=$refHost",
+            app.get("$baseurl/api/v1/video?id=$hash&w=1280&h=720&r=$refHost",
                 headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "*/*"),
-                referer = referer ?: "$baseurl/"
-            ).text.trim()
-        } catch (e: Exception) {
-            Log.e(name, "API failed: ${e.message}")
-            return
-        }
+                referer = referer ?: "$baseurl/").text.trim()
+        } catch (e: Exception) { Log.e(name, "API failed: ${e.message}"); return }
         if (encoded.isBlank()) return
-
-        val decryptedJson = decryptHex(encoded) ?: run {
-            Log.e(name, "AES decrypt failed")
-            return
-        }
-
-        val obj = try {
-            JSONObject(decryptedJson)
-        } catch (e: Exception) {
-            Log.e(name, "JSON parse failed: ${e.message}")
-            return
-        }
-
+        val decryptedJson = decryptHex(encoded) ?: run { Log.e(name, "AES decrypt failed"); return }
+        val obj = try { JSONObject(decryptedJson) } catch (e: Exception) { Log.e(name, "JSON parse failed: ${e.message}"); return }
         var videoPath = obj.optString("hlsVideoTiktok")
         if (videoPath.isEmpty()) videoPath = obj.optString("source")
         if (videoPath.isEmpty()) videoPath = obj.optString("hls")
-        if (videoPath.isEmpty()) { Log.e(name, "no video path in response"); return }
-
+        if (videoPath.isEmpty()) { Log.e(name, "no video path"); return }
         var finalUrl = ""
         try {
-            val cfgObj = obj.optJSONObject("streamingConfig")
-            val cfgRaw = cfgObj?.toString() ?: obj.optString("streamingConfig")
+            val cfgRaw = obj.optJSONObject("streamingConfig")?.toString() ?: obj.optString("streamingConfig")
             if (!cfgRaw.isNullOrBlank()) {
                 val cfg = JSONObject(cfgRaw)
                 val adjust = cfg.optJSONObject("adjust")
                 val order = cfg.optJSONArray("order")
                 val candidates = mutableListOf<JSONObject>()
-                if (order != null) {
-                    for (i in 0 until order.length()) {
-                        adjust?.optJSONObject(order.getString(i))?.let { candidates.add(it) }
-                    }
-                } else {
-                    adjust?.keys()?.forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
-                }
+                if (order != null) { for (i in 0 until order.length()) adjust?.optJSONObject(order.getString(i))?.let { candidates.add(it) } }
+                else adjust?.keys()?.forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
                 for (c in candidates) {
                     if (c.optBoolean("disabled", false)) continue
-                    val domain = c.optString("domain")
-                    if (domain.isBlank()) continue
+                    val domain = c.optString("domain"); if (domain.isBlank()) continue
                     val sb = StringBuilder("https://").append(domain).append(videoPath)
                     val params = c.optJSONObject("params")
                     if (params != null && params.length() > 0) {
-                        sb.append("?")
-                        val keys = params.keys()
-                        var first = true
-                        while (keys.hasNext()) {
-                            val k = keys.next()
-                            if (!first) sb.append("&")
-                            sb.append(k).append("=").append(params.optString(k))
-                            first = false
-                        }
+                        sb.append("?"); val keys = params.keys(); var first = true
+                        while (keys.hasNext()) { val k = keys.next(); if (!first) sb.append("&"); sb.append(k).append("=").append(params.optString(k)); first = false }
                     }
-                    finalUrl = sb.toString()
-                    break
+                    finalUrl = sb.toString(); break
                 }
             }
-        } catch (e: Exception) {
-            Log.e(name, "config parse failed: ${e.message}")
-        }
-
+        } catch (e: Exception) { Log.e(name, "config parse failed: ${e.message}") }
         if (finalUrl.isEmpty()) finalUrl = "$baseurl$videoPath"
-
-        callback(
-            newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
-                this.referer = "$baseurl/"
-                this.quality = Qualities.Unknown.value
-            }
-        )
-
+        callback(newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
+            this.referer = "$baseurl/"; this.quality = Qualities.Unknown.value
+        })
         val subs = obj.optJSONObject("subtitle")
         subs?.keys()?.forEach { lang ->
             val rawPath = subs.optString(lang).split("#").firstOrNull().orEmpty()
@@ -313,25 +234,20 @@ open class UpnsPlayer : ExtractorApi() {
         }
     }
 
-    private fun decryptHex(hex: String): String? {
-        return try {
-            val clean = hex.trim().removeSurrounding("\"")
-            val data = clean.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(AES_KEY.toByteArray(), "AES"), IvParameterSpec(AES_IV.toByteArray()))
-            String(cipher.doFinal(data))
-        } catch (e: Exception) { null }
-    }
+    private fun decryptHex(hex: String): String? = try {
+        val clean = hex.trim().removeSurrounding("\"")
+        val data = clean.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(AES_KEY.toByteArray(), "AES"), IvParameterSpec(AES_IV.toByteArray()))
+        String(cipher.doFinal(data))
+    } catch (e: Exception) { null }
 
     protected fun getBaseUrl(url: String): String =
         try { URI(url).let { "${it.scheme}://${it.host}" } } catch (e: Exception) { mainUrl }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Keys 3-5: GDMirrorbot (SD / HD)
-// FIX: reduced retry delay to 600ms and max retries to 3 so
-//      extraction finishes well within CloudStream's timeout.
-//      GDMirrorbotFHD duplicate class removed entirely.
+// Keys 3-4: GDMirrorbot -> gdmirrorbot.nl  (SD / HD)
 // ─────────────────────────────────────────────────────────────
 open class GDMirrorbot : ExtractorApi() {
     override var name = "StreamHG"
@@ -352,35 +268,17 @@ open class GDMirrorbot : ExtractorApi() {
     ) {
         val sid = url.substringAfterLast("embed/").substringBefore("?").trimEnd('/')
         if (sid.isBlank()) return
-
-        val resolved = try {
-            app.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl)
-        } catch (e: Exception) { Log.e(name, "embed resolve failed: ${e.message}"); return }
-
-        val playerOrigin = try {
-            val u = URI(resolved.url); "${u.scheme}://${u.host}"
-        } catch (e: Exception) { Log.e(name, "bad redirect url: ${resolved.url}"); return }
-
+        val resolved = try { app.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl) }
+            catch (e: Exception) { Log.e(name, "embed resolve failed: ${e.message}"); return }
+        val playerOrigin = try { val u = URI(resolved.url); "${u.scheme}://${u.host}" }
+            catch (e: Exception) { Log.e(name, "bad redirect url: ${resolved.url}"); return }
         val responseText = try {
-            app.post(
-                "$playerOrigin/embedhelper2.php",
-                data = mapOf(
-                    "sid" to sid,
-                    "UserFavSite" to "",
-                    "currentDomain" to playerOrigin.removePrefix("https://"),
-                ),
-                headers = mapOf(
-                    "Referer" to "$mainUrl/embed/$sid",
-                    "Origin" to playerOrigin,
-                    "X-Requested-With" to "XMLHttpRequest",
-                )
+            app.post("$playerOrigin/embedhelper2.php",
+                data = mapOf("sid" to sid, "UserFavSite" to "", "currentDomain" to playerOrigin.removePrefix("https://")),
+                headers = mapOf("Referer" to "$mainUrl/embed/$sid", "Origin" to playerOrigin, "X-Requested-With" to "XMLHttpRequest")
             ).text
         } catch (e: Exception) { Log.e(name, "embedhelper2 failed: ${e.message}"); return }
-
-        val root = tryParseJson<GDEmbedHelper>(responseText) ?: run {
-            Log.e(name, "embedhelper2 unparsable"); return
-        }
-
+        val root = tryParseJson<GDEmbedHelper>(responseText) ?: run { Log.e(name, "embedhelper2 unparsable"); return }
         val rawMresult = root.mresult
         val mirrors: Map<String, String> = when (rawMresult) {
             is Map<*, *> -> @Suppress("UNCHECKED_CAST") (rawMresult as Map<String, String>)
@@ -390,36 +288,23 @@ open class GDMirrorbot : ExtractorApi() {
             } catch (e: Exception) { Log.e(name, "mresult decode failed: ${e.message}"); return }
             else -> { Log.e(name, "mresult missing"); return }
         }
-
         val mirrorTasks = mutableListOf<Pair<String, String>>()
         mirrors["smwh"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add(Pair("smwh", it)) }
         mirrors["strmp2"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add(Pair("strmp2", it)) }
         mirrors["flls"]?.takeIf { it.isNotBlank() }?.let { mirrorTasks.add(Pair("flls", it)) }
-
-        // FIX: 600ms delay (was 1500ms) and maxRetries=3 (was 5) so the loop
-        //      finishes in at most ~1.8s instead of ~7.5s, well inside CloudStream timeout.
-        var currentQueue = mirrorTasks.toList()
-        var attempt = 0
-        val maxRetries = 3
-
+        var currentQueue = mirrorTasks.toList(); var attempt = 0; val maxRetries = 3
         while (currentQueue.isNotEmpty() && attempt <= maxRetries) {
             val nextQueue = mutableListOf<Pair<String, String>>()
             for (task in currentQueue) {
-                val type = task.first
-                val mirrorId = task.second
-                var isExtracted = false
-                val interceptingCallback: (ExtractorLink) -> Unit = { link ->
-                    isExtracted = true; callback.invoke(link)
-                }
+                val type = task.first; val mirrorId = task.second; var isExtracted = false
+                val interceptingCallback: (ExtractorLink) -> Unit = { link -> isExtracted = true; callback.invoke(link) }
                 try {
                     when (type) {
                         "smwh" -> extractStreamHg(mirrorId, subtitleCallback, interceptingCallback)
                         "strmp2" -> {
                             val siteUrl = root.sources?.get("strmp2")?.siteUrl ?: "https://cloudy.p2pplay.pro/#"
                             val fullUrl = if (siteUrl.endsWith("#")) "$siteUrl$mirrorId" else "${siteUrl.trimEnd('/')}#$mirrorId"
-                            val upns = UpnsPlayer()
-                            upns.name = "StreamP2P"
-                            upns.mainUrl = getHost(fullUrl)
+                            val upns = UpnsPlayer(); upns.name = "StreamP2P"; upns.mainUrl = getHost(fullUrl)
                             upns.getUrl(fullUrl, referer, subtitleCallback, interceptingCallback)
                         }
                         "flls" -> {
@@ -427,9 +312,7 @@ open class GDMirrorbot : ExtractorApi() {
                             loadExtractor("${siteUrl.trimEnd('/')}/$mirrorId", referer ?: mainUrl, subtitleCallback, interceptingCallback)
                         }
                     }
-                } catch (e: Exception) {
-                    Log.e(name, "Extraction failed for $type: ${e.message}")
-                }
+                } catch (e: Exception) { Log.e(name, "Extraction failed for $type: ${e.message}") }
                 if (!isExtracted) nextQueue.add(task)
             }
             currentQueue = nextQueue
@@ -438,71 +321,51 @@ open class GDMirrorbot : ExtractorApi() {
         }
     }
 
-    private suspend fun extractStreamHg(
-        mirrorId: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val html = try {
-            app.get("$STREAMHG_BASE$mirrorId", referer = mainUrl).text
-        } catch (e: Exception) { Log.e(name, "StreamHG page failed: ${e.message}"); return }
-
+    private suspend fun extractStreamHg(mirrorId: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val html = try { app.get("$STREAMHG_BASE$mirrorId", referer = mainUrl).text }
+            catch (e: Exception) { Log.e(name, "StreamHG page failed: ${e.message}"); return }
         val packed = PACKED_REGEX.find(html)?.value ?: run { Log.e(name, "StreamHG: no packed JS"); return }
         val unpacked = JsUnpacker(packed).unpack() ?: run { Log.e(name, "StreamHG: unpack failed"); return }
-
         val hlsLinks = HLS_LINKS_REGEX.findAll(unpacked).associate { it.groupValues[1] to it.groupValues[2] }
         if (hlsLinks.isEmpty()) { Log.e(name, "StreamHG: no hls links found"); return }
-
-        var chosenUrl: String? = null
-        var manifestBody: String? = null
+        var chosenUrl: String? = null; var manifestBody: String? = null
         for (key in listOf("hls2", "hls4", "hls3", "hls1")) {
             val candidate = hlsLinks[key] ?: continue
-            try {
-                val body = app.get(candidate, referer = STREAMHG_BASE).text
-                if (body.contains("#EXTM3U")) { chosenUrl = candidate; manifestBody = body; break }
-            } catch (e: Exception) { Log.d(name, "$key unreachable, trying next") }
+            try { val body = app.get(candidate, referer = STREAMHG_BASE).text; if (body.contains("#EXTM3U")) { chosenUrl = candidate; manifestBody = body; break } }
+            catch (e: Exception) { Log.d(name, "$key unreachable, trying next") }
         }
-
         val finalUrl = chosenUrl ?: hlsLinks["hls2"] ?: hlsLinks["hls3"] ?: return
-
         val quality = when {
             manifestBody == null -> Qualities.Unknown.value
             manifestBody.contains("1920x1080") -> Qualities.P1080.value
             manifestBody.contains("1280x720") -> Qualities.P720.value
-            manifestBody.contains("856x480") || manifestBody.contains("854x480") ||
-                manifestBody.contains("640x360") -> Qualities.P480.value
+            manifestBody.contains("856x480") || manifestBody.contains("854x480") || manifestBody.contains("640x360") -> Qualities.P480.value
             else -> Qualities.Unknown.value
         }
-
-        callback(
-            newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
-                this.referer = STREAMHG_BASE
-                this.quality = quality
-            }
-        )
+        callback(newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
+            this.referer = STREAMHG_BASE; this.quality = quality
+        })
     }
 
     protected fun getHost(url: String): String =
         try { URI(url).let { "${it.scheme}://${it.host}" } } catch (e: Exception) { mainUrl }
 
-    data class GDSource(
-        val encryptedValue: String? = null,
-        val encryptedSiteName: String? = null,
-        val encryptedApiKey: String? = null,
-        val siteUrl: String? = null,
-        val embedSuffix: String? = null,
-        val friendlyName: String? = null,
-    )
-
-    data class GDEmbedHelper(
-        val sources: Map<String, GDSource>? = null,
-        val mresult: Any? = null,
-        val sid: String? = null,
-    )
+    data class GDSource(val encryptedValue: String? = null, val encryptedSiteName: String? = null,
+        val encryptedApiKey: String? = null, val siteUrl: String? = null,
+        val embedSuffix: String? = null, val friendlyName: String? = null)
+    data class GDEmbedHelper(val sources: Map<String, GDSource>? = null, val mresult: Any? = null, val sid: String? = null)
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 6: TURBO -> emturbovid.com  (data-hash attribute)
+// Key 5: FHD -> fgdmirrorbot.nl  (same logic as GDMirrorbot)
+// ─────────────────────────────────────────────────────────────
+class FGDMirrorbot : GDMirrorbot() {
+    override var name = "StreamFHD"
+    override var mainUrl = "https://fgdmirrorbot.nl"
+}
+
+// ─────────────────────────────────────────────────────────────
+// Key 6: TURBO -> emturbovid.com
 // ─────────────────────────────────────────────────────────────
 class EmTurboVid : ExtractorApi() {
     override var name = "EmTurboVid"
@@ -516,32 +379,21 @@ class EmTurboVid : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val doc = app.get(url, referer = referer ?: mainUrl).document
-
-        var m3u8 = doc.selectFirst("#video_player[data-hash]")
-            ?.attr("data-hash")?.takeIf { it.contains(".m3u8") }
+        var m3u8 = doc.selectFirst("#video_player[data-hash]")?.attr("data-hash")?.takeIf { it.contains(".m3u8") }
             ?: doc.selectFirst("[data-hash]")?.attr("data-hash")?.takeIf { it.contains(".m3u8") }
-
         if (m3u8 == null) {
-            m3u8 = doc.select("script")
-                .firstOrNull { it.data().contains("var urlPlay") }
-                ?.data()
-                ?.substringAfter("var urlPlay = '", "")
-                ?.substringBefore("'")
-                ?.takeIf { it.startsWith("http") }
+            m3u8 = doc.select("script").firstOrNull { it.data().contains("var urlPlay") }
+                ?.data()?.substringAfter("var urlPlay = '", "")?.substringBefore("'")?.takeIf { it.startsWith("http") }
         }
-
         val finalUrl = m3u8 ?: return
-        callback(
-            newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
-                this.referer = "$mainUrl/"
-                this.quality = Qualities.P1080.value
-            }
-        )
+        callback(newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
+            this.referer = "$mainUrl/"; this.quality = Qualities.P1080.value
+        })
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 7: VIDMOLY -> vidmoly.net  (jwplayer file regex)
+// Key 7: VIDMOLY -> vidmoly.net
 // ─────────────────────────────────────────────────────────────
 class VidMolyNet : ExtractorApi() {
     override var name = "VidMolyNet"
@@ -555,27 +407,18 @@ class VidMolyNet : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val txt = app.get(url, referer = referer ?: mainUrl).text
-
         val m3u8 = Regex("""file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]""").find(txt)?.groupValues?.get(1)
-            ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(txt)?.value
-            ?: return
-
+            ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(txt)?.value ?: return
         Regex("""file\s*:\s*['"](https[^'"]+\.vtt[^'"]*)['"][\s\S]{0,200}?label\s*:\s*['"]([^'"]*)['"]""")
-            .find(txt)?.let { match ->
-                subtitleCallback(SubtitleFile(match.groupValues[2].ifBlank { "English" }, match.groupValues[1]))
-            }
-
-        callback(
-            newExtractorLink(name, name, url = m3u8, type = ExtractorLinkType.M3U8) {
-                this.referer = mainUrl
-                this.quality = Qualities.Unknown.value
-            }
-        )
+            .find(txt)?.let { subtitleCallback(SubtitleFile(it.groupValues[2].ifBlank { "English" }, it.groupValues[1])) }
+        callback(newExtractorLink(name, name, url = m3u8, type = ExtractorLinkType.M3U8) {
+            this.referer = mainUrl; this.quality = Qualities.Unknown.value
+        })
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 8: MULTIQ -> blakiteapi.xyz  (API -> rumble CDN tar-HLS)
+// Key 8: MULTIQ -> blakiteapi.xyz
 // ─────────────────────────────────────────────────────────────
 class Blakite : ExtractorApi() {
     override var name = "Blakite"
@@ -595,49 +438,34 @@ class Blakite : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val path = url.substringAfter("$mainUrl/embed/").trimEnd('/')
-        val tmdbId: String
-        val uniqueId: String?
-        if (path.contains("/")) {
-            tmdbId = path.substringBefore("/"); uniqueId = path.substringAfter("/")
-        } else {
-            tmdbId = path; uniqueId = null
-        }
-
-        val apiUrl = if (uniqueId != null) "$mainUrl/api/get.php?id=$uniqueId&tmdbId=$tmdbId"
-                     else "$mainUrl/api/get.php?tmdbId=$tmdbId"
-
+        val tmdbId: String; val uniqueId: String?
+        if (path.contains("/")) { tmdbId = path.substringBefore("/"); uniqueId = path.substringAfter("/") }
+        else { tmdbId = path; uniqueId = null }
+        val apiUrl = if (uniqueId != null) "$mainUrl/api/get.php?id=$uniqueId&tmdbId=$tmdbId" else "$mainUrl/api/get.php?tmdbId=$tmdbId"
         val json = try {
-            app.get(apiUrl, headers = mapOf("Referer" to url, "Accept" to "application/json", "User-Agent" to USER_AGENT))
-                .parsedSafe<BlakiteResponse>()
+            app.get(apiUrl, headers = mapOf("Referer" to url, "Accept" to "application/json", "User-Agent" to USER_AGENT)).parsedSafe<BlakiteResponse>()
         } catch (e: Exception) { Log.e(name, "API failed: ${e.message}"); return }
-
         val data = json?.takeIf { it.success }?.data ?: run { Log.e(name, "API returned no data"); return }
         val dataId = data.dataId ?: return
-
         if (data.format.equals("M3U8", ignoreCase = true)) {
             val rangeMap = mutableMapOf<String, String>()
             data.ranges?.split("\n")?.forEach { line ->
                 val m = Regex("""(\d+-\d+)\s*\(([^)]+)\)""").find(line.trim())
                 if (m != null) rangeMap[m.groupValues[2].trim()] = m.groupValues[1]
             }
-
             var emitted = false
             for (i in QUALITY_LABELS.indices) {
                 val label = QUALITY_LABELS[i]; val code = QUALITY_CODES[i]
                 val range = rangeMap[label] ?: continue
-                val streamUrl = CDN_BASE + "$dataId.$code.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl&r_range=$range"
-                callback(newExtractorLink(name, "$name [$label]", streamUrl, ExtractorLinkType.M3U8) {
+                callback(newExtractorLink(name, "$name [$label]", CDN_BASE + "$dataId.$code.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl&r_range=$range", ExtractorLinkType.M3U8) {
                     this.referer = ""; this.quality = getQualityFromName(label)
-                })
-                emitted = true
+                }); emitted = true
             }
-
             if (!emitted) {
                 val qid = (data.qid ?: QUALITY_LABELS.size).coerceIn(1, QUALITY_LABELS.size)
                 for (i in 0 until qid) {
                     val label = QUALITY_LABELS[i]; val code = QUALITY_CODES[i]
-                    val streamUrl = CDN_BASE + "$dataId.$code.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl"
-                    callback(newExtractorLink(name, "$name [$label]", streamUrl, ExtractorLinkType.M3U8) {
+                    callback(newExtractorLink(name, "$name [$label]", CDN_BASE + "$dataId.$code.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl", ExtractorLinkType.M3U8) {
                         this.referer = ""; this.quality = getQualityFromName(label)
                     })
                 }
@@ -646,8 +474,7 @@ class Blakite : ExtractorApi() {
             val qid = (data.qid ?: 1).coerceIn(1, QUALITY_LABELS.size)
             for (i in 0 until qid) {
                 val label = QUALITY_LABELS[i]; val code = QUALITY_CODES[i]
-                val streamUrl = "$CDN_BASE$dataId.$code.mp4"
-                callback(newExtractorLink(name, "$name [$label]", streamUrl, INFER_TYPE) {
+                callback(newExtractorLink(name, "$name [$label]", "$CDN_BASE$dataId.$code.mp4", INFER_TYPE) {
                     this.referer = ""; this.quality = getQualityFromName(label)
                 })
             }
@@ -655,17 +482,8 @@ class Blakite : ExtractorApi() {
     }
 
     data class BlakiteResponse(val success: Boolean = false, val data: BlakiteData? = null)
-    data class BlakiteData(
-        val animeTitle: String? = null,
-        val tmdbId: String? = null,
-        val type: String? = null,
-        val seasonNumber: Int? = null,
-        val episodeNumber: Int? = null,
-        val title: String? = null,
-        val dataId: String? = null,
-        val qid: Int? = null,
-        val quality: String? = null,
-        val format: String? = null,
-        val ranges: String? = null,
-    )
+    data class BlakiteData(val animeTitle: String? = null, val tmdbId: String? = null, val type: String? = null,
+        val seasonNumber: Int? = null, val episodeNumber: Int? = null, val title: String? = null,
+        val dataId: String? = null, val qid: Int? = null, val quality: String? = null,
+        val format: String? = null, val ranges: String? = null)
 }
