@@ -1,11 +1,12 @@
 package com.tooniboy
 
 import androidx.appcompat.app.AppCompatActivity
-import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class TooniboyPlugin : BasePlugin() {
+class TooniboyPlugin : Plugin() {
+
     override fun load() {
         registerMainAPI(Tooniboy())
         registerExtractorAPI(Zephyrflick())
