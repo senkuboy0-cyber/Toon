@@ -50,34 +50,21 @@ open class AWSStream : ExtractorApi() {
         val m3u8Url = "$mainUrl/player/index.php?data=$extractedHash&do=getVideo"
         val header = mapOf("x-requested-with" to "XMLHttpRequest")
         val formdata = mapOf("hash" to extractedHash, "r" to mainUrl)
-
         val response = app.post(m3u8Url, headers = header, data = formdata).parsedSafe<Response>()
         response?.videoSource?.let { m3u8 ->
-            callback.invoke(
-                newExtractorLink(name, name, url = m3u8, type = ExtractorLinkType.M3U8) {
-                    this.referer = ""
-                    this.quality = Qualities.P1080.value
-                }
-            )
+            callback.invoke(newExtractorLink(name, name, url = m3u8, type = ExtractorLinkType.M3U8) {
+                this.referer = ""; this.quality = Qualities.P1080.value
+            })
             val extractedPack = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data().orEmpty()
             JsUnpacker(extractedPack).unpack()?.let { unpacked ->
                 Regex("\"kind\"\\s*:\\s*\"captions\"\\s*,\\s*\"file\"\\s*:\\s*\"(https.*?\\.srt)\"")
-                    .find(unpacked)?.groupValues?.get(1)?.let { subtitleUrl ->
-                        subtitleCallback.invoke(SubtitleFile("English", subtitleUrl))
-                    }
+                    .find(unpacked)?.groupValues?.get(1)?.let { subtitleCallback.invoke(SubtitleFile("English", it)) }
             }
         }
     }
 
-    data class Response(
-        val hls: Boolean,
-        val videoImage: String,
-        val videoSource: String,
-        val securedLink: String,
-        val downloadLinks: List<Any?>,
-        val attachmentLinks: List<Any?>,
-        val ck: String,
-    )
+    data class Response(val hls: Boolean, val videoImage: String, val videoSource: String,
+        val securedLink: String, val downloadLinks: List<Any?>, val attachmentLinks: List<Any?>, val ck: String)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -88,33 +75,20 @@ class Abyss : ExtractorApi() {
     override var mainUrl = "https://abyssplayer.com"
     override val requiresReferer = true
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val headers = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Origin" to "https://playhydrax.com",
-            "Referer" to "https://playhydrax.com/"
-        )
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val headers = mapOf("User-Agent" to USER_AGENT, "Origin" to "https://playhydrax.com", "Referer" to "https://playhydrax.com/")
         val document = app.get(url, headers = headers).document
         val scripts = document.select("script").joinToString("\n") { it.data() }
-        val encrypted = Regex("const\\s+datas\\s*=\\s*\"([^\"]*)\"")
-            .find(scripts)?.groupValues?.getOrNull(1) ?: return
+        val encrypted = Regex("const\\s+datas\\s*=\\s*\"([^\"]*)\"").find(scripts)?.groupValues?.getOrNull(1) ?: return
         val decrypted = app.post(
-            url = "https://enc-dec.app/api/dec-abyss",
-            headers = headers,
+            url = "https://enc-dec.app/api/dec-abyss", headers = headers,
             requestBody = """{"text": "$encrypted"}""".toRequestBody("application/json".toMediaType())
         ).parsedSafe<AbyssResponse>()?.result ?: return
         decrypted.sources.filter { it.status }.forEach { source ->
-            callback.invoke(
-                newExtractorLink(source = name, name = "$name [${source.codec.uppercase()}]", url = source.url, type = INFER_TYPE) {
-                    this.quality = getQualityFromName(source.type)
-                    this.headers = mapOf("Referer" to "https://playhydrax.com/")
-                }
-            )
+            callback.invoke(newExtractorLink(source = name, name = "$name [${source.codec.uppercase()}]", url = source.url, type = INFER_TYPE) {
+                this.quality = getQualityFromName(source.type)
+                this.headers = mapOf("Referer" to "https://playhydrax.com/")
+            })
         }
     }
 
@@ -131,20 +105,13 @@ class StreamRuby : ExtractorApi() {
     override var mainUrl = "https://rubystm.com"
     override val requiresReferer = true
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fileCode = url.substringAfterLast("/e/").substringBefore(".html")
         if (fileCode.isBlank()) return
         app.get("$mainUrl/e/$fileCode.html", referer = referer ?: mainUrl)
-        val html = app.post(
-            url = "$mainUrl/dl",
+        val html = app.post(url = "$mainUrl/dl",
             data = mapOf("op" to "embed", "file_code" to fileCode, "auto" to "1", "referer" to (referer ?: "")),
-            referer = "$mainUrl/e/$fileCode.html"
-        ).text
+            referer = "$mainUrl/e/$fileCode.html").text
         val packed = Regex("""eval\(function\(p,a,c,k,e,d\)[\s\S]+?'\|'\)\)""").find(html)?.value ?: return
         val unpacked = JsUnpacker(packed).unpack() ?: return
         val m3u8 = Regex("""file\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1) ?: return
@@ -184,46 +151,83 @@ open class UpnsPlayer : ExtractorApi() {
         val hash = url.substringAfterLast("#").substringBefore("&").substringBefore("?")
             .ifBlank { url.trimEnd('/').substringAfterLast('/') }
         if (hash.isBlank()) return
-        val refHost = try { URI(referer ?: mainUrl).host ?: mainUrl.removePrefix("https://") } catch (e: Exception) { mainUrl.removePrefix("https://") }
+
+        val refHost = try { URI(referer ?: mainUrl).host ?: mainUrl.removePrefix("https://") }
+            catch (e: Exception) { mainUrl.removePrefix("https://") }
+
         val encoded = try {
             app.get("$baseurl/api/v1/video?id=$hash&w=1280&h=720&r=$refHost",
                 headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "*/*"),
                 referer = referer ?: "$baseurl/").text.trim()
         } catch (e: Exception) { Log.e(name, "API failed: ${e.message}"); return }
         if (encoded.isBlank()) return
+
         val decryptedJson = decryptHex(encoded) ?: run { Log.e(name, "AES decrypt failed"); return }
         val obj = try { JSONObject(decryptedJson) } catch (e: Exception) { Log.e(name, "JSON parse failed: ${e.message}"); return }
+
+        // Priority: hlsVideoTiktok > source > hls
         var videoPath = obj.optString("hlsVideoTiktok")
         if (videoPath.isEmpty()) videoPath = obj.optString("source")
         if (videoPath.isEmpty()) videoPath = obj.optString("hls")
-        if (videoPath.isEmpty()) { Log.e(name, "no video path"); return }
-        var finalUrl = ""
-        try {
-            val cfgRaw = obj.optJSONObject("streamingConfig")?.toString() ?: obj.optString("streamingConfig")
-            if (!cfgRaw.isNullOrBlank()) {
-                val cfg = JSONObject(cfgRaw)
-                val adjust = cfg.optJSONObject("adjust")
-                val order = cfg.optJSONArray("order")
-                val candidates = mutableListOf<JSONObject>()
-                if (order != null) { for (i in 0 until order.length()) adjust?.optJSONObject(order.getString(i))?.let { candidates.add(it) } }
-                else adjust?.keys()?.forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
-                for (c in candidates) {
-                    if (c.optBoolean("disabled", false)) continue
-                    val domain = c.optString("domain"); if (domain.isBlank()) continue
-                    val sb = StringBuilder("https://").append(domain).append(videoPath)
-                    val params = c.optJSONObject("params")
-                    if (params != null && params.length() > 0) {
-                        sb.append("?"); val keys = params.keys(); var first = true
-                        while (keys.hasNext()) { val k = keys.next(); if (!first) sb.append("&"); sb.append(k).append("=").append(params.optString(k)); first = false }
+        if (videoPath.isEmpty()) { Log.e(name, "no video path in response"); return }
+
+        // ── FIX: if videoPath is already a full absolute URL, use it directly.
+        // The API sometimes returns a complete CDN URL in hlsVideoTiktok/source.
+        // Prepending a domain to it would produce a broken double-URL like:
+        // "https://tiktokcdn.comhttps://cdn.example.com/v4/..."
+        val finalUrl: String
+        if (videoPath.startsWith("http://") || videoPath.startsWith("https://")) {
+            // Strip duplicate query params: if path already has ?v=X and we'd add ?v=Y, skip
+            finalUrl = videoPath
+        } else {
+            // videoPath is a relative path — build full URL using streamingConfig domain
+            var built = ""
+            try {
+                val cfgRaw = obj.optJSONObject("streamingConfig")?.toString() ?: obj.optString("streamingConfig")
+                if (!cfgRaw.isNullOrBlank()) {
+                    val cfg = JSONObject(cfgRaw)
+                    val adjust = cfg.optJSONObject("adjust")
+                    val order = cfg.optJSONArray("order")
+                    val candidates = mutableListOf<JSONObject>()
+                    if (order != null) {
+                        for (i in 0 until order.length())
+                            adjust?.optJSONObject(order.getString(i))?.let { candidates.add(it) }
+                    } else {
+                        adjust?.keys()?.forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
                     }
-                    finalUrl = sb.toString(); break
+                    for (c in candidates) {
+                        if (c.optBoolean("disabled", false)) continue
+                        // Strip any accidental scheme prefix from domain field
+                        val rawDomain = c.optString("domain")
+                        if (rawDomain.isBlank()) continue
+                        val cleanDomain = rawDomain
+                            .removePrefix("https://").removePrefix("http://").trimEnd('/')
+                        // Ensure path starts with "/"
+                        val cleanPath = if (videoPath.startsWith("/")) videoPath else "/$videoPath"
+                        val sb = StringBuilder("https://").append(cleanDomain).append(cleanPath)
+                        val params = c.optJSONObject("params")
+                        if (params != null && params.length() > 0) {
+                            // Only add "?" if path doesn't already carry query params
+                            sb.append(if (cleanPath.contains("?")) "&" else "?")
+                            val keys = params.keys(); var first = true
+                            while (keys.hasNext()) {
+                                val k = keys.next()
+                                if (!first) sb.append("&")
+                                sb.append(k).append("=").append(params.optString(k))
+                                first = false
+                            }
+                        }
+                        built = sb.toString(); break
+                    }
                 }
-            }
-        } catch (e: Exception) { Log.e(name, "config parse failed: ${e.message}") }
-        if (finalUrl.isEmpty()) finalUrl = "$baseurl$videoPath"
+            } catch (e: Exception) { Log.e(name, "streamingConfig parse failed: ${e.message}") }
+            finalUrl = built.ifEmpty { "$baseurl$videoPath" }
+        }
+
         callback(newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
             this.referer = "$baseurl/"; this.quality = Qualities.Unknown.value
         })
+
         val subs = obj.optJSONObject("subtitle")
         subs?.keys()?.forEach { lang ->
             val rawPath = subs.optString(lang).split("#").firstOrNull().orEmpty()
@@ -260,12 +264,7 @@ open class GDMirrorbot : ExtractorApi() {
         private val HLS_LINKS_REGEX = Regex(""""(hls\d)"\s*:\s*"(https?://[^"]+)"""")
     }
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val sid = url.substringAfterLast("embed/").substringBefore("?").trimEnd('/')
         if (sid.isBlank()) return
         val resolved = try { app.get("$mainUrl/embed/$sid", referer = referer ?: mainUrl) }
@@ -331,7 +330,8 @@ open class GDMirrorbot : ExtractorApi() {
         var chosenUrl: String? = null; var manifestBody: String? = null
         for (key in listOf("hls2", "hls4", "hls3", "hls1")) {
             val candidate = hlsLinks[key] ?: continue
-            try { val body = app.get(candidate, referer = STREAMHG_BASE).text; if (body.contains("#EXTM3U")) { chosenUrl = candidate; manifestBody = body; break } }
+            try { val body = app.get(candidate, referer = STREAMHG_BASE).text
+                if (body.contains("#EXTM3U")) { chosenUrl = candidate; manifestBody = body; break } }
             catch (e: Exception) { Log.d(name, "$key unreachable, trying next") }
         }
         val finalUrl = chosenUrl ?: hlsLinks["hls2"] ?: hlsLinks["hls3"] ?: return
@@ -357,7 +357,7 @@ open class GDMirrorbot : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Key 5: FHD -> fgdmirrorbot.nl  (same logic as GDMirrorbot)
+// Key 5: FHD -> fgdmirrorbot.nl
 // ─────────────────────────────────────────────────────────────
 class FGDMirrorbot : GDMirrorbot() {
     override var name = "StreamFHD"
@@ -372,12 +372,7 @@ class EmTurboVid : ExtractorApi() {
     override var mainUrl = "https://emturbovid.com"
     override val requiresReferer = false
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val doc = app.get(url, referer = referer ?: mainUrl).document
         var m3u8 = doc.selectFirst("#video_player[data-hash]")?.attr("data-hash")?.takeIf { it.contains(".m3u8") }
             ?: doc.selectFirst("[data-hash]")?.attr("data-hash")?.takeIf { it.contains(".m3u8") }
@@ -400,12 +395,7 @@ class VidMolyNet : ExtractorApi() {
     override var mainUrl = "https://vidmoly.net"
     override val requiresReferer = false
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val txt = app.get(url, referer = referer ?: mainUrl).text
         val m3u8 = Regex("""file\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]""").find(txt)?.groupValues?.get(1)
             ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(txt)?.value ?: return
@@ -431,12 +421,7 @@ class Blakite : ExtractorApi() {
         private val QUALITY_LABELS = listOf("240p", "360p", "480p", "720p", "1080p")
     }
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val path = url.substringAfter("$mainUrl/embed/").trimEnd('/')
         val tmdbId: String; val uniqueId: String?
         if (path.contains("/")) { tmdbId = path.substringBefore("/"); uniqueId = path.substringAfter("/") }
