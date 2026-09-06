@@ -165,64 +165,12 @@ open class UpnsPlayer : ExtractorApi() {
         val decryptedJson = decryptHex(encoded) ?: run { Log.e(name, "AES decrypt failed"); return }
         val obj = try { JSONObject(decryptedJson) } catch (e: Exception) { Log.e(name, "JSON parse failed: ${e.message}"); return }
 
-        // Priority: hlsVideoTiktok > source > hls
-        var videoPath = obj.optString("hlsVideoTiktok")
-        if (videoPath.isEmpty()) videoPath = obj.optString("source")
-        if (videoPath.isEmpty()) videoPath = obj.optString("hls")
-        if (videoPath.isEmpty()) { Log.e(name, "no video path in response"); return }
-
-        // ── FIX: if videoPath is already a full absolute URL, use it directly.
-        // The API sometimes returns a complete CDN URL in hlsVideoTiktok/source.
-        // Prepending a domain to it would produce a broken double-URL like:
-        // "https://tiktokcdn.comhttps://cdn.example.com/v4/..."
-        val finalUrl: String
-        if (videoPath.startsWith("http://") || videoPath.startsWith("https://")) {
-            // Strip duplicate query params: if path already has ?v=X and we'd add ?v=Y, skip
-            finalUrl = videoPath
-        } else {
-            // videoPath is a relative path — build full URL using streamingConfig domain
-            var built = ""
-            try {
-                val cfgRaw = obj.optJSONObject("streamingConfig")?.toString() ?: obj.optString("streamingConfig")
-                if (!cfgRaw.isNullOrBlank()) {
-                    val cfg = JSONObject(cfgRaw)
-                    val adjust = cfg.optJSONObject("adjust")
-                    val order = cfg.optJSONArray("order")
-                    val candidates = mutableListOf<JSONObject>()
-                    if (order != null) {
-                        for (i in 0 until order.length())
-                            adjust?.optJSONObject(order.getString(i))?.let { candidates.add(it) }
-                    } else {
-                        adjust?.keys()?.forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
-                    }
-                    for (c in candidates) {
-                        if (c.optBoolean("disabled", false)) continue
-                        // Strip any accidental scheme prefix from domain field
-                        val rawDomain = c.optString("domain")
-                        if (rawDomain.isBlank()) continue
-                        val cleanDomain = rawDomain
-                            .removePrefix("https://").removePrefix("http://").trimEnd('/')
-                        // Ensure path starts with "/"
-                        val cleanPath = if (videoPath.startsWith("/")) videoPath else "/$videoPath"
-                        val sb = StringBuilder("https://").append(cleanDomain).append(cleanPath)
-                        val params = c.optJSONObject("params")
-                        if (params != null && params.length() > 0) {
-                            // Only add "?" if path doesn't already carry query params
-                            sb.append(if (cleanPath.contains("?")) "&" else "?")
-                            val keys = params.keys(); var first = true
-                            while (keys.hasNext()) {
-                                val k = keys.next()
-                                if (!first) sb.append("&")
-                                sb.append(k).append("=").append(params.optString(k))
-                                first = false
-                            }
-                        }
-                        built = sb.toString(); break
-                    }
-                }
-            } catch (e: Exception) { Log.e(name, "streamingConfig parse failed: ${e.message}") }
-            finalUrl = built.ifEmpty { "$baseurl$videoPath" }
-        }
+        // Step 1: Try streamingConfig first — it gives the real CDN URL (94.x.x.x).
+        // hlsVideoTiktok is a TikTok CDN URL that is geo-restricted and does not play.
+        // source/hls are used only when streamingConfig produces nothing.
+        val finalUrl = buildFromStreamingConfig(obj)
+            ?: buildFromAbsolutePath(obj)
+            ?: run { Log.e(name, "no playable URL found in response"); return }
 
         callback(newExtractorLink(name, name, url = finalUrl, type = ExtractorLinkType.M3U8) {
             this.referer = "$baseurl/"; this.quality = Qualities.Unknown.value
@@ -236,6 +184,69 @@ open class UpnsPlayer : ExtractorApi() {
                 subtitleCallback(SubtitleFile(lang.uppercase(), subUrl))
             }
         }
+    }
+
+    /**
+     * Builds the video URL from streamingConfig.adjust domains + the relative video path.
+     * This always produces the real CDN URL (e.g. 94.131.x.x) that actually plays.
+     * Returns null if streamingConfig is absent or all candidates are disabled.
+     */
+    private fun buildFromStreamingConfig(obj: JSONObject): String? {
+        return try {
+            // Get the relative video path (must NOT be a full URL — we need a path like /v4/...)
+            var videoPath = obj.optString("source").takeIf { it.isNotEmpty() && !it.startsWith("http") }
+                ?: obj.optString("hls").takeIf { it.isNotEmpty() && !it.startsWith("http") }
+                ?: return null
+
+            val cfgRaw = obj.optJSONObject("streamingConfig")?.toString()
+                ?: obj.optString("streamingConfig").takeIf { it.isNotBlank() }
+                ?: return null
+
+            val cfg = JSONObject(cfgRaw)
+            val adjust = cfg.optJSONObject("adjust") ?: return null
+            val order = cfg.optJSONArray("order")
+
+            val candidates = mutableListOf<JSONObject>()
+            if (order != null) {
+                for (i in 0 until order.length())
+                    adjust.optJSONObject(order.getString(i))?.let { candidates.add(it) }
+            } else {
+                adjust.keys().forEach { k -> adjust.optJSONObject(k)?.let { candidates.add(it) } }
+            }
+
+            for (c in candidates) {
+                if (c.optBoolean("disabled", false)) continue
+                val rawDomain = c.optString("domain").takeIf { it.isNotBlank() } ?: continue
+                val cleanDomain = rawDomain.removePrefix("https://").removePrefix("http://").trimEnd('/')
+                val cleanPath = if (videoPath.startsWith("/")) videoPath else "/$videoPath"
+                val sb = StringBuilder("https://").append(cleanDomain).append(cleanPath)
+                val params = c.optJSONObject("params")
+                if (params != null && params.length() > 0) {
+                    sb.append(if (cleanPath.contains("?")) "&" else "?")
+                    val keys = params.keys(); var first = true
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (!first) sb.append("&")
+                        sb.append(k).append("=").append(params.optString(k))
+                        first = false
+                    }
+                }
+                return sb.toString()
+            }
+            null
+        } catch (e: Exception) {
+            Log.e(name, "streamingConfig parse failed: ${e.message}"); null
+        }
+    }
+
+    /**
+     * Fallback: if source/hls field already is an absolute URL use it directly.
+     * hlsVideoTiktok is intentionally skipped — it is a geo-restricted TikTok CDN URL.
+     */
+    private fun buildFromAbsolutePath(obj: JSONObject): String? {
+        val source = obj.optString("source").takeIf { it.startsWith("http") }
+        val hls    = obj.optString("hls").takeIf { it.startsWith("http") }
+        return source ?: hls
     }
 
     private fun decryptHex(hex: String): String? = try {
