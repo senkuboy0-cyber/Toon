@@ -27,6 +27,6 @@ cloudstream {
         "Movie"
     )
     isCrossPlatform = false
-    requiresResources = true
+    requiresResources = false
     iconUrl = "https://tooniboy.co/wp-content/uploads/2024/03/cropped-tooniboy-high-resolution-logo-transparent-7.png"
 }
